@@ -22,7 +22,8 @@ import math
 import time
 from collections.abc import Iterable
 from pathlib import Path
-
+import tomllib
+from functools import cache
 import bpy
 from replication.constants import (CONNECTING, STATE_ACTIVE, STATE_AUTH,
                                    STATE_CONFIG, STATE_INITIAL, STATE_LOBBY,
@@ -152,13 +153,17 @@ def get_preferences():
         return bpy.context.preferences.addons[__package__].preferences
 
 
+@cache
 def get_version():
-    if __package__ not in bpy.context.preferences.addons:
-        return "version unknown"
-    else:
-        addon_module = importlib.import_module(bpy.context.preferences.addons[__package__].module)
-        version = addon_module.bl_info.get('version', "version unknown")
-        return f"{version[0]}.{version[1]}.{version[2]}"
+    # Get version from multi_user/blender_manifest.toml
+    file = Path(__file__).parent.joinpath("blender_manifest.toml")
+    if not file.exists():
+        return "unknown"
+
+    # Read the file
+    with open(file, "rb") as f:
+        data = tomllib.load(f)
+        return data.get("version", "unknown")
 
 
 def current_milli_time():
