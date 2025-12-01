@@ -114,7 +114,8 @@ def load_frame(frame_data, frame):
     assert 'strokes' in frame_data['drawing']
 
     # Load stroke points
-    frame.drawing.add_strokes(frame_data['drawing']['strokes'])
+    if len(frame_data['drawing']['strokes']) > 0:
+        frame.drawing.add_strokes(frame_data['drawing']['strokes'])
     # frame.drawing.attributes.update()
     # Load stroke metadata
     np_load_attributes(frame.drawing.attributes, frame_data['drawing']['attributes'])
