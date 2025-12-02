@@ -198,7 +198,7 @@ def find_data_from_name(name=None):
         instance = bpy.data.armatures[name]
     elif name in bpy.data.grease_pencils.keys():
         instance = bpy.data.grease_pencils[name]
-    elif name in bpy.data.grease_pencils_v3.keys():
+    elif bpy.app.version < (5, 0, 0) and name in bpy.data.grease_pencils_v3.keys():
         instance = bpy.data.grease_pencils_v3[name]
     elif name in bpy.data.curves.keys():
         instance = bpy.data.curves[name]

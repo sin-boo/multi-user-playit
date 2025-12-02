@@ -23,8 +23,6 @@ __all__ = [
     'bl_camera',
     'bl_collection',
     'bl_curve',
-    'bl_gpencil',
-    'bl_gpencil3',
     'bl_image',
     'bl_light',
     'bl_scene',
@@ -45,6 +43,14 @@ __all__ = [
     "bl_volume",
 ]  # Order here defines execution order
 
+
+if bpy.app.version >= (5, 0, 0):
+    __all__.append('bl_gpencil')
+else:
+    __all__.extend([
+        'bl_gpencil_legacy',
+        'bl_gpencil3',
+    ])
 
 # from . import *
 import importlib
