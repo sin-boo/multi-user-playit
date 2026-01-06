@@ -72,7 +72,7 @@ class BlLightprobe(ReplicatedDatablock):
 
     @staticmethod
     def resolve(data: dict) -> object:
-        uuid = data.get('uuid') 
+        uuid = data.get('uuid')
         return resolve_datablock_from_uuid(uuid, bpy.data.lightprobes)
 
     @staticmethod
@@ -80,5 +80,13 @@ class BlLightprobe(ReplicatedDatablock):
         return []
 
 
-_type = bpy.types.LightProbe
+_type = (
+    bpy.types.LightProbe
+    if bpy.app.version < (5, 0, 0)
+    else [
+        bpy.types.LightProbeSphere,
+        bpy.types.LightProbePlane,
+        bpy.types.LightProbeVolume,
+    ]
+)
 _class = BlLightprobe
