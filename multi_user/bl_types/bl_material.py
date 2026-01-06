@@ -542,7 +542,7 @@ class BlMaterial(ReplicatedDatablock):
     def resolve_deps(datablock: object) -> list[object]:
         deps = []
 
-        if datablock.use_nodes:
+        if datablock.use_nodes and datablock.node_tree:
             deps.extend(get_node_tree_dependencies(datablock.node_tree))
             deps.extend(resolve_animation_dependencies(datablock.node_tree))
         deps.extend(resolve_animation_dependencies(datablock))
