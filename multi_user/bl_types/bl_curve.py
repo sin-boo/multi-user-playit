@@ -262,5 +262,5 @@ class BlCurve(ReplicatedDatablock):
             or get_preferences().sync_flags.sync_during_editmode
 
 
-_type = [bpy.types.Curve, bpy.types.TextCurve]
+_type = [bpy.types.SurfaceCurve, bpy.types.Curve, bpy.types.TextCurve]
 _class = BlCurve

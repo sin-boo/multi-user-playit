@@ -19,6 +19,7 @@
 import copy
 
 import bpy
+from bpy_extras import anim_utils
 from replication.protocol import ReplicatedDatablock
 
 from .. import utils
@@ -219,6 +220,7 @@ def dump_animation_data(datablock):
     animation_data = {}
     if has_action(datablock):
         animation_data['action'] = datablock.animation_data.action.uuid
+        animation_data['action_slot'] = datablock.animation_data.action_slot.identifier
     if has_driver(datablock):
         animation_data['drivers'] = []
         for driver in datablock.animation_data.drivers:
@@ -244,6 +246,7 @@ def load_animation_data(animation_data, datablock):
         if action:
             action = resolve_datablock_from_uuid(action, bpy.data.actions)
             datablock.animation_data.action = action
+            datablock.animation_data.action_slot = action.slots[animation_data['action_slot']]
         elif datablock.animation_data.action:
             datablock.animation_data.action = None
 
@@ -274,18 +277,43 @@ class BlAction(ReplicatedDatablock):
 
     @staticmethod
     def load(data: dict, datablock: object):
-        for dumped_fcurve in data["fcurves"]:
-            dumped_data_path = dumped_fcurve["data_path"]
-            dumped_array_index = dumped_fcurve["dumped_array_index"]
+        # Load slots
+        for slot in datablock.slots:
+            datablock.slots.remove(slot)
 
-            # create fcurve if needed
-            fcurve = datablock.fcurves.find(
-                dumped_data_path, index=dumped_array_index)
-            if fcurve is None:
-                fcurve = datablock.fcurves.new(
-                    dumped_data_path, index=dumped_array_index)
+        for slot in data['slots'].values():
+            new_slot = datablock.slots.new(slot['target_id_type'], slot['name_display'])
 
-            load_fcurve(dumped_fcurve, fcurve)
+            if bpy.app.version >= (5,0,0):
+                channelbag = anim_utils.action_ensure_channelbag_for_slot(datablock, new_slot)
+                for dumped_fcurve in slot["fcurves"]:
+                    dumped_data_path = dumped_fcurve["data_path"]
+                    dumped_array_index = dumped_fcurve["dumped_array_index"]
+
+                    # create fcurve if needed
+                    fcurve = channelbag.fcurves.find(
+                        dumped_data_path,
+                        index=dumped_array_index
+                    )
+                    if fcurve is None:
+                        fcurve = channelbag.fcurves.new(
+                            dumped_data_path, 
+                            index=dumped_array_index,
+                        )
+                    load_fcurve(dumped_fcurve, fcurve)
+            else:
+                for dumped_fcurve in data["fcurves"]:
+                    dumped_data_path = dumped_fcurve["data_path"]
+                    dumped_array_index = dumped_fcurve["dumped_array_index"]
+
+                    # create fcurve if needed
+                    fcurve = datablock.fcurves.find(
+                        dumped_data_path, index=dumped_array_index)
+                    if fcurve is None:
+                        fcurve = datablock.fcurves.new(
+                            dumped_data_path, index=dumped_array_index)
+
+                    load_fcurve(dumped_fcurve, fcurve)
 
         id_root = data.get('id_root')
 
@@ -311,11 +339,26 @@ class BlAction(ReplicatedDatablock):
         dumper.depth = 1
         data = dumper.dump(datablock)
 
-        data["fcurves"] = []
 
-        for fcurve in datablock.fcurves:
-            data["fcurves"].append(dump_fcurve(fcurve, use_numpy=True))
-
+        dumper.depth = 1
+        dumper.include_filter = [
+            'name_display',
+            'target_id_type',
+            'identifier'
+        ]
+        dumper.depth = 2
+        data['slots'] = dumper.dump(datablock.slots)
+        
+        if bpy.app.version >= (5,0,0):
+            for slot in datablock.slots:
+                channelbag = anim_utils.action_get_channelbag_for_slot(datablock, slot)
+                data['slots'][slot.identifier]["fcurves"] = []
+                for fcurve in channelbag.fcurves:
+                    data['slots'][slot.identifier]["fcurves"].append(dump_fcurve(fcurve, use_numpy=True))
+        else:
+            data["fcurves"] = []
+            for fcurve in datablock.fcurves:
+                data["fcurves"].append(dump_fcurve(fcurve, use_numpy=True))
         return data
 
     @staticmethod
