@@ -24,7 +24,7 @@ from ..utils import get_preferences
 from .bl_datablock import resolve_datablock_from_uuid
 from .bl_material import dump_materials_slots, load_materials_slots
 from .dump_anything import (Dumper, Loader, np_dump_collection,
-                            np_load_collection, np_dump_attributes, np_load_attributes)
+                            np_load_collection)
 
 STROKE_POINT = [
     'co',
@@ -52,32 +52,32 @@ STROKE = [
 ]
 
 
-def dump_drawing_attributes(drawing):
-    """ Dump a grease pencil drawing to a dict
+def dump_stroke(stroke):
+    """ Dump a grease pencil stroke to a dict
 
-        :param drawing: target grease pencil drawing
-        :type drawing: bpy.types.GPencilStroke
+        :param stroke: target grease pencil stroke
+        :type stroke: bpy.types.GPencilStroke
         :return: (p_count, p_data)
     """
-    return (len(drawing.points), np_dump_collection(drawing.attributes, drawing.attributes.keys()))
+    return (len(stroke.points), np_dump_collection(stroke.points, STROKE_POINT))
 
 
-def load_drawing_attributes(drawing_data, drawing):
-    """ Load a grease pencil drawing from a dict
+def load_stroke(stroke_data, stroke):
+    """ Load a grease pencil stroke from a dict
 
-        :param stroke_data: dumped grease pencil drawing
+        :param stroke_data: dumped grease pencil stroke
         :type stroke_data: dict
-        :param drawing: target grease pencil drawing
-        :type drawing: bpy.types.GPencilStroke
+        :param stroke: target grease pencil stroke
+        :type stroke: bpy.types.GPencilStroke
     """
-    assert drawing and drawing_data
+    assert stroke and stroke_data
 
-    # drawing.points.add(drawing_data[0])
-    np_load_collection(drawing_data[1], drawing.attributes, None)
+    stroke.points.add(stroke_data[0])
+    np_load_collection(stroke_data[1], stroke.points, STROKE_POINT)
 
     # HACK: Temporary fix to trigger a BKE_gpencil_stroke_geometry_update to
     # fix fill issues
-    # drawing.uv_scale = 1.0
+    stroke.uv_scale = 1.0
 
 
 def dump_frame(frame):
@@ -92,10 +92,11 @@ def dump_frame(frame):
 
     dumped_frame = dict()
     dumped_frame['frame_number'] = frame.frame_number
-    dumped_frame['drawing'] = {
-        'attributes': np_dump_attributes(frame.drawing.attributes),
-        'strokes': [len(stroke.points) for stroke in frame.drawing.strokes]
-    }
+    dumped_frame['strokes'] = np_dump_collection(frame.strokes, STROKE)
+    dumped_frame['strokes_points'] = []
+
+    for stroke in frame.strokes:
+        dumped_frame['strokes_points'].append(dump_stroke(stroke))
 
     return dumped_frame
 
@@ -110,15 +111,14 @@ def load_frame(frame_data, frame):
     """
 
     assert frame and frame_data
-    assert 'attributes' in frame_data['drawing']
-    assert 'strokes' in frame_data['drawing']
 
     # Load stroke points
-    if len(frame_data['drawing']['strokes']) > 0:
-        frame.drawing.add_strokes(frame_data['drawing']['strokes'])
-    # frame.drawing.attributes.update()
+    for stroke_data in frame_data['strokes_points']:
+        target_stroke = frame.strokes.new()
+        load_stroke(stroke_data, target_stroke)
+
     # Load stroke metadata
-    np_load_attributes(frame.drawing.attributes, frame_data['drawing']['attributes'])
+    np_load_collection(frame_data['strokes'], frame.strokes, STROKE)
 
 
 def dump_layer(layer):
@@ -133,14 +133,20 @@ def dump_layer(layer):
     dumper = Dumper()
 
     dumper.include_filter = [
-        'name',
+        'info',
         'opacity',
         'channel_color',
+        'color',
         'tint_color',
         'tint_factor',
         'vertex_paint_opacity',
-        'radius_offset',
+        'line_change',
         'use_onion_skinning',
+        'use_annotation_onion_skinning',
+        'annotation_onion_before_range',
+        'annotation_onion_after_range',
+        'annotation_onion_before_color',
+        'annotation_onion_after_color',
         'pass_index',
         # 'viewlayer_render',
         'blend_mode',
@@ -149,15 +155,20 @@ def dump_layer(layer):
         'lock',
         'lock_frame',
         # 'lock_material',
-        'use_masks',
+        # 'use_mask_layer',
         'use_lights',
         'use_solo_mode',
         'select',
+        'show_points',
         'show_in_front',
+        # 'thickness'
         # 'parent',
+        # 'parent_type',
         # 'parent_bone',
         # 'matrix_inverse',
     ]
+    if layer.thickness != 0:
+        dumper.include_filter.append('thickness')
 
     dumped_layer = dumper.dump(layer)
 
@@ -183,12 +194,13 @@ def load_layer(layer_data, layer):
 
     for frame_data in layer_data["frames"]:
         target_frame = layer.frames.new(frame_data['frame_number'])
+
         load_frame(frame_data, target_frame)
 
 
 def layer_changed(datablock: object, data: dict) -> bool:
     if datablock.layers.active and \
-            datablock.layers.active.name != data["active_layers"]:
+            datablock.layers.active.info != data["active_layers"]:
         return True
     else:
         return False
@@ -228,7 +240,7 @@ class BlGpencil(ReplicatedDatablock):
                 layer_data = data["layers"].get(layer)
 
                 # if layer not in datablock.layers.keys():
-                target_layer = datablock.layers.new(data["layers"][layer]["name"])
+                target_layer = datablock.layers.new(data["layers"][layer]["info"])
                 # else:
                 #     target_layer = target.layers[layer]
                 #     target_layer.clear()
@@ -244,6 +256,8 @@ class BlGpencil(ReplicatedDatablock):
         dumper.include_filter = [
             'name',
             'zdepth_offset',
+            'stroke_thickness_space',
+            'pixel_factor',
             'stroke_depth_order'
         ]
         data = dumper.dump(datablock)
@@ -251,9 +265,9 @@ class BlGpencil(ReplicatedDatablock):
         data['layers'] = {}
 
         for layer in datablock.layers:
-            data['layers'][layer.name] = dump_layer(layer)
+            data['layers'][layer.info] = dump_layer(layer)
 
-        data["active_layers"] = datablock.layers.active.name if datablock.layers.active else "None"
+        data["active_layers"] = datablock.layers.active.info if datablock.layers.active else "None"
         data["eval_frame"] = bpy.context.scene.frame_current
         return data
 

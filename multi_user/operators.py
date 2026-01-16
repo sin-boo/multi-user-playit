@@ -275,7 +275,8 @@ def setup_timer():
     deleyables.append(session_update)
     deleyables.append(session_user_sync)
     deleyables.append(session_listen)
-    deleyables.append(timers.AnnotationUpdates())
+    if bpy.app.version < (5, 0, 0):
+        deleyables.append(timers.AnnotationUpdates())
 
 
 def get_active_server_preset(context):

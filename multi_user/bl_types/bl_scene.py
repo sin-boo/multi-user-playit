@@ -275,6 +275,11 @@ VIEW_SETTINGS = [
     'black_level'
 ]
 
+def _all_strips(sequence_editor: bpy.types.SequenceEditor):
+    if bpy.app.version < (5, 0, 0):
+        return sequence_editor.sequences_all
+    else:
+        return sequence_editor.strips_all
 
 def dump_sequence(sequence) -> dict:
     """ Dump a sequence to a dict
@@ -527,7 +532,7 @@ class BlScene(ReplicatedDatablock):
         vse = datablock.sequence_editor
         if vse:
             dumped_sequences = {}
-            for seq in vse.sequences_all:
+            for seq in _all_strips(vse):
                 dumped_sequences[seq.name] = dump_sequence(seq)
             data['sequences'] = dumped_sequences
 
@@ -535,7 +540,7 @@ class BlScene(ReplicatedDatablock):
         if datablock.timeline_markers:
             data['timeline_markers'] = [(m.name, m.frame, getattr(m.camera, 'uuid', None)) for m in datablock.timeline_markers]
 
-        if datablock.grease_pencil:
+        if bpy.app.version < (5, 0, 0) and datablock.grease_pencil:
             data['grease_pencil'] = datablock.grease_pencil.uuid
 
         return data
@@ -552,15 +557,17 @@ class BlScene(ReplicatedDatablock):
             deps.append(datablock.world)
 
         # annotations
-        if datablock.grease_pencil:
+        # TODO: support proper annotation for blender 5.0
+        if bpy.app.version < (5, 0, 0) and datablock.grease_pencil:
             deps.append(datablock.grease_pencil)
 
         deps.extend(resolve_animation_dependencies(datablock))
 
         # Sequences
         vse = datablock.sequence_editor
+
         if vse:
-            for sequence in vse.sequences_all:
+            for sequence in _all_strips(vse):
                 if sequence.type == 'MOVIE' and sequence.filepath:
                     deps.append(Path(bpy.path.abspath(sequence.filepath)))
                 elif sequence.type == 'SOUND' and sequence.sound:
