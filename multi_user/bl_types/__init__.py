@@ -33,6 +33,7 @@ __all__ = [
     'bl_metaball',
     'bl_lattice',
     'bl_lightprobe',
+    # 'bl_pointcloud', # Notes: PointClouds are currently not supported in the python api, and require some refactor to be supported. For now, https://stackoverflow.com/questions/79767580/populate-a-blender-pointcloud-via-python-api-with-numpy-data
     'bl_speaker',
     'bl_font',
     'bl_sound',
