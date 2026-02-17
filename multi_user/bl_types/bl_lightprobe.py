@@ -80,13 +80,15 @@ class BlLightprobe(ReplicatedDatablock):
         return []
 
 
-_type = (
-    bpy.types.LightProbe
-    if bpy.app.version < (5, 0, 0)
-    else [
+if bpy.app.version < (5, 0, 0):
+    _type = [
+        bpy.types.LightProbe,
+    ]
+else:
+    _type = [
         bpy.types.LightProbeSphere,
         bpy.types.LightProbePlane,
         bpy.types.LightProbeVolume,
     ]
-)
+
 _class = BlLightprobe
