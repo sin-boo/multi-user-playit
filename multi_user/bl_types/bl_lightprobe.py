@@ -29,7 +29,7 @@ class BlLightprobe(ReplicatedDatablock):
     bl_id = "lightprobes"
     bl_class = bpy.types.LightProbe
     bl_check_common = False
-    bl_icon = 'LIGHTPROBE_GRID'
+    bl_icon = 'OUTLINER_DATA_LIGHTPROBE'
     bl_reload_parent = False
 
     @staticmethod
