@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 # Change the values according to your extension
 id = "multi_user"
-version = "0.7.0"
+version = "0.7.1"
 name = "Multiuser"
 blender_version_min = "4.3.0"
 tagline = "Enable real-time collaborative workflow inside blender"
@@ -24,7 +24,7 @@ wheels = [
    "./wheels/pyzmq-26.2.1-cp313-cp313-win_amd64.whl",
    "./wheels/pyzmq-26.2.1-cp313-cp313-macosx_10_15_universal2.whl",
    "./wheels/pyzmq-26.2.1-cp313-cp313-manylinux_2_28_x86_64.whl",
-   "./wheels/replication-0.9.10-py3-none-any.whl",
+   "./wheels/replication-0.9.11-py3-none-any.whl",
 ]
 
 [permissions]

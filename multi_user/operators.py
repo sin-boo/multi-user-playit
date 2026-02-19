@@ -225,7 +225,12 @@ def on_connection_end(reason="none"):
         if isinstance(handler, logging.FileHandler):
             logger.removeHandler(handler)
     if reason != "user":
-        bpy.ops.wm.session_notify_user('INVOKE_DEFAULT', message=f"Disconnected from session. Reason: {reason}. ")  # TODO: change op wm.session_notify_user to add ui + change reason (in replication->interface)
+        bpy.ops.wm.session_notify_user(
+            'INVOKE_DEFAULT',
+            icon='ERROR',
+            title="Session disconnected",
+            message=f"{reason}"
+        )  # TODO: change op wm.session_notify_user to add ui + change reason (in replication->interface)
 
 
 def setup_logging():
@@ -390,7 +395,8 @@ class SessionHostOperator(bpy.types.Operator):
 
         repo = Repository(
             rdp=bpy_protocol,
-            username=settings.username)
+            username=settings.username
+        )
 
         # Host a session
         if settings.init_method == 'EMPTY':
@@ -853,6 +859,8 @@ class SessionNotifyOperator(bpy.types.Operator):
     bl_label = "Multi-user"
     bl_description = "multiuser notification"
 
+    icon: bpy.props.StringProperty(default='NONE')
+    title: bpy.props.StringProperty()
     message: bpy.props.StringProperty()
 
     @classmethod
@@ -862,12 +870,13 @@ class SessionNotifyOperator(bpy.types.Operator):
     def execute(self, context):
         return {'FINISHED'}
 
-    def draw(self, context):
-        layout = self.layout
-        layout.row().label(text=self.message)
-
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
+        return context.window_manager.invoke_confirm(
+            self,
+            event,
+            icon=self.icon,  # 'NONE', 'WARNING', 'QUESTION', 'ERROR', 'INFO'
+            title=self.title,
+            message=self.message,)
 
 
 class SessionSaveBackupOperator(bpy.types.Operator, ExportHelper):

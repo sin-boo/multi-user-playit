@@ -212,14 +212,14 @@ You can run the dedicated server on any platform by following these steps:
 
     .. code-block:: bash
 
-        replication.serve
+        replication.server
 
 .. hint::
     You can also specify a custom **port** (-p), **timeout** (-t), **admin password** (-pwd), **log level (ERROR, WARNING, INFO or DEBUG)** (-l) and **log file** (-lf) with the following optional arguments
 
     .. code-block:: bash
 
-        replication.serve -p 5555 -pwd admin -t 5000 -l INFO -lf server.log
+        replication.server -p 5555 -pwd admin -t 5000 -l INFO -lf server.log
 
 Here, for example, a server is instantiated on port 5555, with password 'admin', a 5 second timeout, and logging enabled.
 
@@ -572,7 +572,7 @@ For example, I would like to launch my server with a different administrator pas
 
     .. code-block:: bash
         
-        replication.serve -pwd supersecretpassword -p 5555 -t 3000 -l DEBUG -lf logname.log
+        replication.server -pwd supersecretpassword -p 5555 -t 3000 -l DEBUG -lf logname.log
 
 Now, my configuration should look like this:
 
@@ -691,7 +691,7 @@ We're finally ready to launch the server. Simply run:
 
     .. code-block:: bash
         
-        replication.serve -p 5555 -pwd admin -t 5000 -l INFO -lf server.log
+        replication.server -p 5555 -pwd admin -t 5000 -l INFO -lf server.log
 
 See :ref:`cmd-line` for a description of optional parameters
 
