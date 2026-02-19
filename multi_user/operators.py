@@ -426,9 +426,14 @@ class SessionHostOperator(bpy.types.Operator):
                 subprocess_python_args=bpy.app.python_args,
             )
         except Exception as e:
-            self.report({'ERROR'}, repr(e))
-            logging.error(f"Error: {e}")
             traceback.print_exc()
+            bpy.ops.wm.session_notify_user(
+                'INVOKE_DEFAULT',
+                icon='ERROR',
+                title="Session cancelled",
+                message=f"{e}"
+            )
+            return {"CANCELLED"}
 
         # Background client updates service
         setup_timer()
@@ -593,13 +598,13 @@ class SessionPropertyRightOperator(bpy.types.Operator):
         if session:
             if runtime_settings.clients == RP_COMMON:
                 porcelain.unlock(session.repository,
-                                 self.key,
+                                 [self.key],
                                  ignore_warnings=True,
                                  affect_dependencies=self.recursive)
             else:
                 porcelain.lock(
                     session.repository,
-                    self.key,
+                    [self.key],
                     runtime_settings.clients,
                     ignore_warnings=True,
                     affect_dependencies=self.recursive,
