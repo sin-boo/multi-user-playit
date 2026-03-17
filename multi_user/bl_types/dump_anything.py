@@ -597,12 +597,10 @@ class Loader:
         _constructors = {
             T.ColorRampElement: (CONSTRUCTOR_NEW, ["position"]),
             T.ParticleSettingsTextureSlot: (CONSTRUCTOR_ADD, []),
-            T.GpencilModifier: (CONSTRUCTOR_NEW, ["name", "type"]),
         }
 
         destructors = {
             T.ColorRampElement: DESTRUCTOR_REMOVE,
-            T.GpencilModifier: DESTRUCTOR_CLEAR,
         }
         element_type = element.bl_rna_property.fixed_type
 
@@ -731,8 +729,9 @@ class Loader:
                 continue
             try:
                 self._load_any(default.extend(k), v)
-            except Exception:
-                logging.debug(f"Skipping {k}")
+            except Exception as e:
+                logging.info(f"Skipping {k}")
+                logging.error(f"{e}")
 
     @property
     def match_subset_all(self):

@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-03-17
+
+- fix color ramp support
+
 ## [0.6.8] - 2025-09-29
 
 - Blender 4 compatibility
