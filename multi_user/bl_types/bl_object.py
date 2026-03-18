@@ -52,7 +52,7 @@ def get_node_group_properties_identifiers(node_group):
     if not node_group:
         return props_ids
     for socket in node_group.interface.items_tree:
-        if socket.socket_type in IGNORED_SOCKETS:
+        if not hasattr(socket, 'socket_type') or socket.socket_type in IGNORED_SOCKETS:
             continue
         
         # TODO: Clean 

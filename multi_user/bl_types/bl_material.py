@@ -47,7 +47,15 @@ IGNORED_SOCKETS = [
 ]
 IGNORED_SOCKETS_TYPES = (NodeSocketGeometry, NodeSocketShader, NodeSocketVirtual)
 ID_NODE_SOCKETS = (NodeSocketObject, NodeSocketCollection, NodeSocketMaterial)
-
+SOCKET_ATTRIBUTES = [
+    'name',
+    'socket_type',
+    'in_out',
+    'min_value',
+    'max_value',
+    'subtype',
+    'structure_type'
+]
 
 def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
     """ Load a node into a node_tree from a dict
@@ -286,17 +294,16 @@ def dump_node_tree_sockets(sockets: bpy.types.Collection) -> dict:
         :type socket_id: str
         :return: dict
     """
+    socket_dumper = Dumper()
+    socket_dumper.include_filter = SOCKET_ATTRIBUTES
     sockets_data = []
     for socket in sockets:
         if not socket.socket_type:
             logging.error(f"Socket {socket.name} has no type, skipping")
             raise ValueError(f"Socket {socket.name} has no type, skipping")
+
         sockets_data.append(
-            (
-                socket.name,
-                socket.socket_type,
-                socket.in_out
-            )
+            socket_dumper.dump(socket)
         )
 
     return sockets_data
@@ -315,17 +322,19 @@ def load_node_tree_sockets(interface: bpy.types.NodeTreeInterface,
     """
     # Remove old sockets
     interface.clear()
+    socket_loader = Loader()
 
     # Check for new sockets
-    for name, socket_type, in_out in sockets_data:
-        if not socket_type:
+    for socket_data in sockets_data:
+        if 'socket_type' not in socket_data:
             logging.error(f"Socket {name} has no type, skipping")
             continue
         socket = interface.new_socket(
-            name,
-            in_out=in_out,
-            socket_type=socket_type
+            socket_data['name'],
+            in_out=socket_data['in_out'],
+            socket_type=socket_data['socket_type']
         )
+        socket_loader.load(socket, socket_data)
 
 
 def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeTree) -> dict:
