@@ -44,6 +44,7 @@ SHAPEKEY_BLOCK_ATTR = [
 ]
 
 SUPPORTED_GEOMETRY_NODE_PARAMETERS = (int, str, float)
+NODE_SOCKET_ID = ['NodeSocketCollection', 'NodeSocketObject', 'NodeSocketImage', 'NodeSocketTexture', 'NodeSocketMaterial']
 
 
 def get_node_group_properties_identifiers(node_group):
@@ -53,12 +54,15 @@ def get_node_group_properties_identifiers(node_group):
     for socket in node_group.interface.items_tree:
         if socket.socket_type in IGNORED_SOCKETS:
             continue
-
-        props_ids.append((f"{socket.identifier}_attribute_name", 'NodeSocketString'))
+        
+        # TODO: Clean 
+        if socket.socket_type not in NODE_SOCKET_ID:
+            props_ids.append((f"{socket.identifier}_attribute_name", 'NodeSocketString'))
         if socket.in_out == 'OUTPUT':
             continue
         props_ids.append((socket.identifier, socket.socket_type))
-        props_ids.append((f"{socket.identifier}_use_attribute", 'NodeSocketBool'))
+        if socket.socket_type not in NODE_SOCKET_ID:
+            props_ids.append((f"{socket.identifier}_use_attribute", 'NodeSocketBool'))
 
     return props_ids
 
@@ -138,7 +142,7 @@ def dump_modifier_geometry_node_props(modifier: bpy.types.Modifier) -> list:
         try:
             prop_value = modifier[prop_id]
         except KeyError as e:
-            logging.error(f"fail to dump geomety node modifier property : {prop_id} ({e})")
+            logging.warning(f"fail to dump geomety node modifier property : {prop_id} ({e})")
         else:
             dump = None
             if isinstance(prop_value, bpy.types.ID):
@@ -163,6 +167,8 @@ def load_modifier_geometry_node_props(dumped_modifier: dict, target_modifier: bp
     """
 
     for input_index, inpt in enumerate(get_node_group_properties_identifiers(target_modifier.node_group)):
+        if inpt[0] not in target_modifier:
+            continue
         dumped_value, dumped_type = dumped_modifier['props'][input_index]
         if dumped_type in ['NodeSocketInt', 'NodeSocketFloat', 'NodeSocketString', 'NodeSocketBool']:
             target_modifier[inpt[0]] = dumped_value
