@@ -50,11 +50,14 @@ ID_NODE_SOCKETS = (NodeSocketObject, NodeSocketCollection, NodeSocketMaterial)
 SOCKET_ATTRIBUTES = [
     'name',
     'socket_type',
+    'item_type',
     'in_out',
     'min_value',
     'max_value',
     'subtype',
-    'structure_type'
+    'structure_type',
+    'default_closed',
+    'description'
 ]
 
 def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
@@ -87,41 +90,44 @@ def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
         for sock_name, sock_type in node_data['repeat_items'].items():
             target_node.repeat_items.new(sock_type, sock_name)
 
-    inputs_data = node_data.get('inputs')
-    if inputs_data:
-        inputs = [i for i in target_node.inputs if not isinstance(i, IGNORED_SOCKETS_TYPES)]
-        for idx, inpt in enumerate(inputs):
-            if idx < len(inputs_data) and hasattr(inpt, "default_value"):
-                loaded_input = inputs_data[idx]
-                try:
-                    if isinstance(inpt, ID_NODE_SOCKETS):
-                        inpt.default_value = get_datablock_from_uuid(loaded_input, None)
-                    else:
-                        inpt.default_value = loaded_input
-                        setattr(inpt, 'default_value', loaded_input)
-                except Exception as e:
-                    logging.warning(f"Node {target_node.name} input {inpt.name} parameter not supported, skipping ({e})")
-            else:
-                logging.warning(f"Node {target_node.name} input length mismatch.")
 
-    outputs_data = node_data.get('outputs')
-    if outputs_data:
-        outputs = [o for o in target_node.outputs if not isinstance(o, IGNORED_SOCKETS_TYPES)]
-        for idx, output in enumerate(outputs):
-            if idx < len(outputs_data) and hasattr(output, "default_value"):
-                loaded_output = outputs_data[idx]
-                try:
-                    if isinstance(output, ID_NODE_SOCKETS):
-                        output.default_value = get_datablock_from_uuid(loaded_output, None)
-                    else:
-                        output.default_value = loaded_output
-                except Exception as e:
+def load_node_io(nodes_data: dict, node_tree: bpy.types.ShaderNodeTree):
+    for target_node in node_tree.nodes:
+        node_data = nodes_data[target_node.name]
+        inputs_data = node_data.get('inputs')
+        if inputs_data:
+            inputs = [i for i in target_node.inputs if not isinstance(i, IGNORED_SOCKETS_TYPES)]
+            for idx, inpt in enumerate(inputs):
+                if idx < len(inputs_data) and hasattr(inpt, "default_value"):
+                    loaded_input = inputs_data[idx]
+                    try:
+                        if isinstance(inpt, ID_NODE_SOCKETS):
+                            inpt.default_value = get_datablock_from_uuid(loaded_input, None)
+                        else:
+                            inpt.default_value = loaded_input
+                            setattr(inpt, 'default_value', loaded_input)
+                    except Exception as e:
+                        logging.warning(f"Node {target_node.name} input {inpt.name} parameter not supported, skipping ({e})")
+                else:
+                    logging.warning(f"Node {target_node.name} input length mismatch.")
+
+        outputs_data = node_data.get('outputs')
+        if outputs_data:
+            outputs = [o for o in target_node.outputs if not isinstance(o, IGNORED_SOCKETS_TYPES)]
+            for idx, output in enumerate(outputs):
+                if idx < len(outputs_data) and hasattr(output, "default_value"):
+                    loaded_output = outputs_data[idx]
+                    try:
+                        if isinstance(output, ID_NODE_SOCKETS):
+                            output.default_value = get_datablock_from_uuid(loaded_output, None)
+                        else:
+                            output.default_value = loaded_output
+                    except Exception as e:
+                        logging.warning(
+                            f"Node {target_node.name} output {output.name} parameter not supported, skipping ({e})")
+                else:
                     logging.warning(
-                        f"Node {target_node.name} output {output.name} parameter not supported, skipping ({e})")
-            else:
-                logging.warning(
-                    f"Node {target_node.name} output length mismatch.")
-
+                        f"Node {target_node.name} output length mismatch.")
 
 def dump_node(node: bpy.types.ShaderNode) -> dict:
     """ Dump a single node to a dict
@@ -279,7 +285,7 @@ def dump_node_tree(node_tree: bpy.types.ShaderNodeTree) -> dict:
         'type': type(node_tree).__name__
     }
 
-    sockets = [item for item in node_tree.interface.items_tree if item.item_type == 'SOCKET']
+    sockets = [item for item in node_tree.interface.items_tree if item.item_type in ['SOCKET', 'PANEL']]
     node_tree_data['interface'] = dump_node_tree_sockets(sockets)
 
     return node_tree_data
@@ -298,12 +304,11 @@ def dump_node_tree_sockets(sockets: bpy.types.Collection) -> dict:
     socket_dumper.include_filter = SOCKET_ATTRIBUTES
     sockets_data = []
     for socket in sockets:
-        if not socket.socket_type:
-            logging.error(f"Socket {socket.name} has no type, skipping")
-            raise ValueError(f"Socket {socket.name} has no type, skipping")
-
+        socket_data = socket_dumper.dump(socket)
+        if socket.parent and socket.parent.index != -1:
+            socket_data['parent'] = socket.parent.index 
         sockets_data.append(
-            socket_dumper.dump(socket)
+            socket_data
         )
 
     return sockets_data
@@ -326,15 +331,31 @@ def load_node_tree_sockets(interface: bpy.types.NodeTreeInterface,
 
     # Check for new sockets
     for socket_data in sockets_data:
-        if 'socket_type' not in socket_data:
-            logging.error(f"Socket {name} has no type, skipping")
-            continue
-        socket = interface.new_socket(
-            socket_data['name'],
-            in_out=socket_data['in_out'],
-            socket_type=socket_data['socket_type']
-        )
+        if socket_data['item_type'] == 'SOCKET':
+            socket = interface.new_socket(
+                socket_data['name'],
+                in_out=socket_data['in_out'],
+                socket_type=socket_data['socket_type']
+            )
+        elif socket_data['item_type'] == 'PANEL':
+            socket = interface.new_panel(
+                socket_data['name'],
+                description=socket_data['description'],
+                default_closed=socket_data['default_closed']
+            )
         socket_loader.load(socket, socket_data)
+    
+    # for socket_data in sockets_data:
+    #     if 'parent' in socket_data:
+    #         socket_parent_index = socket_data['parent']
+    #         socket_parent = interface.items_tree[socket_parent_index]
+    #         if type(socket_parent) != bpy.types.NodeTreeInterfacePanel:
+    #             continue
+            # interface.move_to_parent(socket, socket_parent)
+
+    # Load parents
+    # sockets = [item for item in interface.items_tree if item.item_type == 'SOCKET']
+    # for socket in sockets:
 
 
 def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeTree) -> dict:
@@ -380,6 +401,8 @@ def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeT
     target_node_tree.links.clear()
 
     load_links(node_tree_data["links"], target_node_tree)
+
+    load_node_io(node_tree_data["nodes"], target_node_tree)
 
 
 def get_node_tree_dependencies(node_tree: bpy.types.NodeTree) -> list:
