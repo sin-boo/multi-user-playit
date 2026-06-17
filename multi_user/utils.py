@@ -19,16 +19,267 @@
 import importlib
 import logging
 import math
+import re
+import sys
 import time
 from collections.abc import Iterable
 from pathlib import Path
 import tomllib
 from functools import cache
 import bpy
-from replication.constants import (CONNECTING, STATE_ACTIVE, STATE_AUTH,
+from replication.constants import (CONNECTING, FETCHED, STATE_ACTIVE, STATE_AUTH,
                                    STATE_CONFIG, STATE_INITIAL, STATE_LOBBY,
                                    STATE_QUITTING, STATE_SRV_SYNC,
                                    STATE_SYNCING, STATE_WAITING)
+
+
+NETWORK_LOGGER_NAME = "multi_user.network"
+_last_connect_target = ("", 5555)
+_connected_session_info = {
+    "host": "",
+    "port": 5555,
+    "server_name": "",
+    "use_server_password": False,
+    "use_admin_password": False,
+    "is_host": False,
+}
+_session_log_path = ""
+_network_log_buffer = []
+_NETWORK_LOG_BUFFER_MAX = 2000
+SESSION_STATE_LABELS = {
+    STATE_INITIAL: "OFFLINE",
+    STATE_AUTH: "AUTHENTICATION",
+    CONNECTING: "CONNECTING",
+    STATE_LOBBY: "LOBBY",
+    STATE_SYNCING: "FETCHING",
+    STATE_SRV_SYNC: "PUSHING",
+    STATE_ACTIVE: "ONLINE",
+    STATE_QUITTING: "QUITTING",
+}
+
+
+def get_network_logger():
+    return logging.getLogger(NETWORK_LOGGER_NAME)
+
+
+def network_log(level, message, *args):
+    """Log and mirror to the system console for Blender's scripting / console view."""
+    logger = get_network_logger()
+    logger.log(level, message, *args)
+    try:
+        text = message % args if args else message
+    except TypeError:
+        text = message
+    line = f"[MULTIUSER-NET] {text}"
+    print(line, flush=True)
+    _network_log_buffer.append(line)
+    if len(_network_log_buffer) > _NETWORK_LOG_BUFFER_MAX:
+        del _network_log_buffer[:len(_network_log_buffer) - _NETWORK_LOG_BUFFER_MAX]
+
+
+def set_session_log_file(path: str):
+    global _session_log_path
+    _session_log_path = path
+
+
+def get_active_session_log_path():
+    if _session_log_path and Path(_session_log_path).is_file():
+        return _session_log_path
+    import logging
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.FileHandler):
+            return handler.baseFilename
+    return None
+
+
+def find_latest_session_log(cache_directory: str):
+    cache = Path(cache_directory)
+    if not cache.is_dir():
+        return None
+    logs = sorted(
+        cache.glob("multiuser_*.log"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    return str(logs[0]) if logs else None
+
+
+def get_network_log_buffer_text():
+    return "\n".join(_network_log_buffer)
+
+
+def read_log_file(path: str):
+    return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+def open_log_in_text_editor(context, content: str, title: str, filepath: str | None = None):
+    """Show log text in a Text Editor area (reuse or create one)."""
+    text_name = f"MU_Log_{title}" if title else "MU_Log"
+    text = bpy.data.texts.get(text_name)
+    if text is None:
+        text = bpy.data.texts.new(text_name)
+    text.clear()
+    text.write(content)
+    if filepath:
+        text.filepath = filepath
+
+    screen = context.window.screen
+    for area in screen.areas:
+        if area.type == 'TEXT_EDITOR':
+            space = area.spaces.active
+            space.text = text
+            space.show_line_numbers = True
+            space.show_word_wrap = True
+            return text
+
+    for area in screen.areas:
+        if area.type in {'VIEW_3D', 'PROPERTIES', 'PREFERENCES', 'DOPESHEET_EDITOR'}:
+            area.type = 'TEXT_EDITOR'
+            space = area.spaces.active
+            space.text = text
+            space.show_line_numbers = True
+            space.show_word_wrap = True
+            return text
+
+    return text
+
+
+def open_log_externally(path: str):
+    import os
+    import platform
+    import subprocess
+
+    abs_path = str(Path(path).resolve())
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(abs_path)
+    elif system == "Darwin":
+        subprocess.Popen(["open", abs_path])
+    else:
+        subprocess.Popen(["xdg-open", abs_path])
+    return abs_path
+
+
+def set_connected_session_info(
+    host: str,
+    port: int,
+    server_name: str = "",
+    use_server_password: bool = False,
+    use_admin_password: bool = False,
+    is_host: bool = False,
+):
+    global _last_connect_target, _connected_session_info
+    _last_connect_target = (host, port)
+    _connected_session_info = {
+        "host": host,
+        "port": port,
+        "server_name": server_name or "(unnamed)",
+        "use_server_password": use_server_password,
+        "use_admin_password": use_admin_password,
+        "is_host": is_host,
+    }
+
+
+def clear_connected_session_info():
+    global _connected_session_info
+    _connected_session_info = {
+        "host": "",
+        "port": 5555,
+        "server_name": "",
+        "use_server_password": False,
+        "use_admin_password": False,
+        "is_host": False,
+    }
+
+
+def get_connected_session_info(context=None):
+    """Return endpoint metadata for the active or last-connected session."""
+    info = dict(_connected_session_info)
+    if info["host"]:
+        return info
+
+    if context is not None:
+        settings = get_preferences()
+        presets = settings.server_preset
+        if presets:
+            index = context.window_manager.server_index
+            if index > len(presets) - 1:
+                index = 0
+            preset = presets[index]
+            return {
+                "host": preset.ip,
+                "port": preset.port,
+                "server_name": preset.server_name,
+                "use_server_password": preset.use_server_password,
+                "use_admin_password": preset.use_admin_password,
+                "is_host": False,
+            }
+
+    host, port = _last_connect_target
+    return {
+        "host": host,
+        "port": port,
+        "server_name": "",
+        "use_server_password": False,
+        "use_admin_password": False,
+        "is_host": False,
+    }
+
+
+def log_session_state_change(previous_state, current_state, reason: str = ""):
+    previous = SESSION_STATE_LABELS.get(previous_state, str(previous_state))
+    current = SESSION_STATE_LABELS.get(current_state, str(current_state))
+    network_log(logging.INFO, "session state: %s -> %s", previous, current)
+    if reason:
+        network_log(logging.INFO, "session detail: %s", reason)
+    if current_state == STATE_AUTH:
+        network_log(
+            logging.INFO,
+            "waiting for server auth reply (timeout = connection timeout in preferences)",
+        )
+
+
+
+IP_REGEX = re.compile(
+    r"^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}"
+    r"([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$"
+)
+HOSTNAME_REGEX = re.compile(
+    r"^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*"
+    r"([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$"
+)
+
+
+def normalize_server_address(value: str):
+    """Split host[:port] pasted from playit.gg or similar into host and port."""
+    value = value.strip()
+    if not value:
+        return value, None
+
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1 and len(value) > end + 1 and value[end + 1] == ":":
+            host = value[1:end]
+            port_str = value[end + 2:]
+            if port_str.isdigit():
+                return host, int(port_str)
+        return value, None
+
+    if ":" in value:
+        host, _, port_str = value.rpartition(":")
+        if host and port_str.isdigit():
+            return host.strip(), int(port_str)
+
+    return value, None
+
+
+def validate_server_host(host: str):
+    host = host.strip()
+    if IP_REGEX.fullmatch(host):
+        return host
+    if HOSTNAME_REGEX.fullmatch(host):
+        return host
+    return None
 
 
 CLEARED_DATABLOCKS = [
@@ -73,6 +324,109 @@ def find_from_attr(attr_name, attr_value, list):
         if getattr(item, attr_name, None) == attr_value:
             return item
     return None
+
+
+ASSET_TYPE_IDS = frozenset({'file', 'images', 'materials'})
+FINALIZE_BLOCKING_TYPE_IDS = frozenset({'file', 'images', 'materials', 'node_groups'})
+TEXTURE_SHADING_TYPES = frozenset({'MATERIAL', 'RENDERED'})
+
+
+def printProgressBar(iteration, total, prefix='', suffix='', decimals=1, length=100, fill='█', fill_empty='  '):
+    """Build a text progress bar for UI overlays."""
+    if total == 0:
+        return ""
+    filledLength = int(length * iteration // total)
+    bar = fill * filledLength + fill_empty * (length - filledLength)
+    return f"{prefix} |{bar}| {iteration}/{total}{suffix}"
+
+
+def is_texture_shading_active(context: bpy.types.Context) -> bool:
+    """True when any 3D viewport in the window uses Material or Rendered shading."""
+    window = getattr(context, 'window', None)
+    if window is None:
+        return False
+    for area in window.screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        for space in area.spaces:
+            if space.type == 'VIEW_3D' and space.shading.type in TEXTURE_SHADING_TYPES:
+                return True
+    return False
+
+
+def get_asset_sync_progress() -> tuple[int, int]:
+    """Return (applied, total) for asset datablocks in the replication graph."""
+    from replication.interface import session
+    from .bl_types.bl_material import get_material_node_tree_finalize_progress
+
+    if not session or not getattr(session, 'repository', None):
+        return (0, 0)
+
+    total = 0
+    applied = 0
+    for node in session.repository.graph.values():
+        if not node.data:
+            continue
+        if node.data.get('type_id') not in ASSET_TYPE_IDS:
+            continue
+        total += 1
+        if node.state != FETCHED:
+            applied += 1
+
+    finalized, finalize_total = get_material_node_tree_finalize_progress()
+    total += finalize_total
+    applied += finalized
+
+    return (applied, total)
+
+
+def is_deferred_asset_type(type_id: str | None) -> bool:
+    return type_id in ASSET_TYPE_IDS
+
+
+def textures_fetch_enabled(context: bpy.types.Context | None = None) -> bool:
+    ctx = context or bpy.context
+    runtime = getattr(ctx.window_manager, 'session', None)
+    return bool(runtime and runtime.textures_fetch_enabled)
+
+
+def enable_textures_fetch(context: bpy.types.Context | None = None) -> bool:
+    """Enable deferred texture/material sync after user picks Material/Rendered shading."""
+    ctx = context or bpy.context
+    runtime = getattr(ctx.window_manager, 'session', None)
+    if runtime is None or runtime.textures_fetch_enabled:
+        return False
+    runtime.textures_fetch_enabled = True
+    return True
+
+
+def reset_textures_fetch_state(context: bpy.types.Context | None = None) -> None:
+    ctx = context or bpy.context
+    runtime = getattr(ctx.window_manager, 'session', None)
+    if runtime is not None:
+        runtime.textures_fetch_enabled = False
+    update_textures_fetch_on_shading_change._previous = False
+
+
+def update_textures_fetch_on_shading_change(context: bpy.types.Context | None = None) -> bool:
+    """Start deferred asset apply when the user switches into Material/Rendered shading."""
+    ctx = context or bpy.context
+    current = is_texture_shading_active(ctx)
+    previous = getattr(update_textures_fetch_on_shading_change, '_previous', False)
+    update_textures_fetch_on_shading_change._previous = current
+    if current and not previous:
+        return enable_textures_fetch(ctx)
+    return False
+
+
+def schedule_flush_history(delay: float = 0.5) -> None:
+    """Defer undo history flush so connect does not block the UI."""
+
+    def _flush():
+        flush_history()
+        return None
+
+    bpy.app.timers.register(_flush, first_interval=delay)
 
 
 def flush_history():

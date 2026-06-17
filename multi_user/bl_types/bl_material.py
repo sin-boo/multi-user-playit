@@ -21,9 +21,11 @@ import logging
 import re
 
 from .dump_anything import Loader, Dumper
+from replication.constants import FETCHED
 from replication.protocol import ReplicatedDatablock
 
 from .bl_datablock import get_datablock_from_uuid, resolve_datablock_from_uuid
+from ..utils import ASSET_TYPE_IDS
 from .bl_action import (
     dump_animation_data,
     load_animation_data,
@@ -241,9 +243,45 @@ def load_links(links_data, node_tree):
     """
 
     for link in links_data:
-        input_socket = node_tree.nodes[link['to_node']].inputs[int(link['to_socket'])]
-        output_socket = node_tree.nodes[link['from_node']].outputs[int(link['from_socket'])]
-        node_tree.links.new(input_socket, output_socket)
+        to_node = node_tree.nodes.get(link['to_node'])
+        from_node = node_tree.nodes.get(link['from_node'])
+        if to_node is None or from_node is None:
+            logging.warning(
+                "Skipping link: node missing (to=%s, from=%s)",
+                link.get('to_node'),
+                link.get('from_node'),
+            )
+            continue
+
+        to_idx = int(link['to_socket'])
+        from_idx = int(link['from_socket'])
+        if to_idx >= len(to_node.inputs) or from_idx >= len(from_node.outputs):
+            logging.warning(
+                "Skipping link %s.%s -> %s.%s: socket index out of range "
+                "(inputs=%d, outputs=%d)",
+                link.get('from_node'),
+                from_idx,
+                link.get('to_node'),
+                to_idx,
+                len(to_node.inputs),
+                len(from_node.outputs),
+            )
+            continue
+
+        try:
+            node_tree.links.new(
+                to_node.inputs[to_idx],
+                from_node.outputs[from_idx],
+            )
+        except Exception as e:
+            logging.warning(
+                "Skipping link %s.%s -> %s.%s: %s",
+                link.get('from_node'),
+                from_idx,
+                link.get('to_node'),
+                to_idx,
+                e,
+            )
 
 
 def dump_links(links):
@@ -396,13 +434,127 @@ def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeT
 
         zone_input.pair_with_output(zone_output)
 
-    # TODO: load only required nodes links
-    # Load nodes links
+    finalize_node_tree(node_tree_data, target_node_tree)
+
+
+def resolve_node_group_refs(node_tree_data: dict, target_node_tree: bpy.types.NodeTree):
+    """Assign nested node groups once their datablocks are available."""
+    for node_id, node_data in node_tree_data["nodes"].items():
+        node_tree_uuid = node_data.get('node_tree_uuid')
+        if not node_tree_uuid:
+            continue
+        target_node = target_node_tree.nodes.get(node_id)
+        if target_node is None:
+            continue
+        node_group = get_datablock_from_uuid(node_tree_uuid, None)
+        if node_group is None:
+            logging.warning(
+                "Node %s references missing node group %s",
+                node_id,
+                node_tree_uuid,
+            )
+            continue
+        if target_node.node_tree != node_group:
+            target_node.node_tree = node_group
+
+
+def finalize_node_tree(node_tree_data: dict, target_node_tree: bpy.types.NodeTree):
+    """Resolve group references and wire links after all node trees are loaded."""
+    if not node_tree_data or target_node_tree is None:
+        return
+    resolve_node_group_refs(node_tree_data, target_node_tree)
     target_node_tree.links.clear()
-
     load_links(node_tree_data["links"], target_node_tree)
-
     load_node_io(node_tree_data["nodes"], target_node_tree)
+
+
+_node_trees_finalized = False
+_geometry_node_trees_finalized = False
+_node_tree_finalize_queue = []
+_geometry_node_tree_finalize_queue = []
+_node_tree_finalize_total = 0
+_geometry_node_tree_finalize_total = 0
+_NODE_TREE_FINALIZE_BATCH_SIZE = 2
+
+
+def reset_node_tree_finalize_state():
+    global _node_trees_finalized, _geometry_node_trees_finalized
+    global _node_tree_finalize_queue, _geometry_node_tree_finalize_queue
+    global _node_tree_finalize_total, _geometry_node_tree_finalize_total
+    _node_trees_finalized = False
+    _geometry_node_trees_finalized = False
+    _node_tree_finalize_queue = []
+    _geometry_node_tree_finalize_queue = []
+    _node_tree_finalize_total = 0
+    _geometry_node_tree_finalize_total = 0
+
+
+def _finalize_queue(queue: list, batch_size: int = _NODE_TREE_FINALIZE_BATCH_SIZE) -> int:
+    finalized = 0
+    while queue and finalized < batch_size:
+        node_tree_data, target_node_tree = queue.pop(0)
+        finalize_node_tree(node_tree_data, target_node_tree)
+        finalized += 1
+    return finalized
+
+
+def get_material_node_tree_finalize_progress() -> tuple[int, int]:
+    remaining = len(_node_tree_finalize_queue)
+    return (_node_tree_finalize_total - remaining, _node_tree_finalize_total)
+
+
+def maybe_finalize_node_trees(repository, textures_enabled: bool = False) -> None:
+    """Finalize node trees once their datablocks have been applied."""
+    global _node_trees_finalized, _geometry_node_trees_finalized
+    global _node_tree_finalize_queue, _geometry_node_tree_finalize_queue
+    global _node_tree_finalize_total, _geometry_node_tree_finalize_total
+
+    if not _geometry_node_trees_finalized:
+        pending_groups = any(
+            node.state == FETCHED and node.data and
+            node.data.get('type_id') == 'node_groups'
+            for node in repository.graph.values()
+        )
+        if not pending_groups:
+            if not _geometry_node_tree_finalize_queue and _geometry_node_tree_finalize_total == 0:
+                for node_id in repository.heads:
+                    node_ref = repository.graph.get(node_id)
+                    if node_ref is None or not node_ref.data:
+                        continue
+                    if node_ref.data.get('type_id') == 'node_groups':
+                        _geometry_node_tree_finalize_queue.append(
+                            (node_ref.data, node_ref.instance)
+                        )
+                _geometry_node_tree_finalize_total = len(_geometry_node_tree_finalize_queue)
+
+            _finalize_queue(_geometry_node_tree_finalize_queue)
+            if not _geometry_node_tree_finalize_queue:
+                _geometry_node_trees_finalized = True
+
+    if not textures_enabled or _node_trees_finalized:
+        return
+
+    for node in repository.graph.values():
+        if node.state == FETCHED and node.data and \
+                node.data.get('type_id') in ASSET_TYPE_IDS:
+            return
+
+    if not _node_tree_finalize_queue and _node_tree_finalize_total == 0:
+        for node_id in repository.heads:
+            node_ref = repository.graph.get(node_id)
+            if node_ref is None or not node_ref.data:
+                continue
+            type_id = node_ref.data.get('type_id')
+            if type_id == 'materials' and node_ref.data.get('use_nodes'):
+                if node_ref.instance and node_ref.instance.node_tree:
+                    _node_tree_finalize_queue.append(
+                        (node_ref.data['node_tree'], node_ref.instance.node_tree)
+                    )
+        _node_tree_finalize_total = len(_node_tree_finalize_queue)
+
+    _finalize_queue(_node_tree_finalize_queue)
+    if not _node_tree_finalize_queue:
+        _node_trees_finalized = True
 
 
 def get_node_tree_dependencies(node_tree: bpy.types.NodeTree) -> list:

@@ -18,7 +18,6 @@
 import logging
 import os
 import random
-import re
 import string
 from pathlib import Path
 from uuid import uuid4
@@ -28,11 +27,8 @@ from replication.constants import RP_COMMON
 from replication.interface import session
 
 from . import bl_types, environment, ui
-from .utils import get_expanded_icon, get_folder_size, get_preferences
-
-# From https://stackoverflow.com/a/106223
-IP_REGEX = re.compile("^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$")
-HOSTNAME_REGEX = re.compile("^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$")
+from .utils import (get_expanded_icon, get_folder_size, get_preferences,
+                    normalize_server_address, validate_server_host)
 
 # SERVER PRESETS AT LAUNCH
 DEFAULT_PRESETS = {
@@ -78,13 +74,13 @@ def update_panel_category(self, context):
 
 
 def update_ip(self, context):
-    ip = IP_REGEX.search(self.ip)
-    dns = HOSTNAME_REGEX.search(self.ip)
+    host, port = normalize_server_address(self.ip)
+    if port is not None:
+        self['port'] = port
 
-    if ip:
-        self['ip'] = ip.group()
-    elif dns:
-        self['ip'] = dns.group()
+    validated = validate_server_host(host)
+    if validated:
+        self['ip'] = validated
     else:
         logging.error("Wrong IP format")
         self['ip'] = "127.0.0.1"
@@ -118,7 +114,11 @@ class ReplicatedDatablock(bpy.types.PropertyGroup):
 
 class ServerPreset(bpy.types.PropertyGroup):
     server_name: bpy.props.StringProperty(default="")  # type:ignore
-    ip: bpy.props.StringProperty(default="127.0.0.1", update=update_ip)  # type:ignore
+    ip: bpy.props.StringProperty(
+        default="127.0.0.1",
+        update=update_ip,
+        description="Host or host:port. For playit.gg, paste the tunnel address from playit (public port, not 5555)",
+    )  # type:ignore
     port: bpy.props.IntProperty(default=5555)  # type:ignore
     use_server_password: bpy.props.BoolProperty(default=False)  # type:ignore
     server_password: bpy.props.StringProperty(default="", subtype = "PASSWORD")  # type:ignore
@@ -200,8 +200,13 @@ class SessionPrefs(bpy.types.AddonPreferences):
     # User host session settings
     host_port: bpy.props.IntProperty(
         name="host_port",
-        description='Distant host port',
-        default=5555
+        description=(
+            "Local server base port (TCP). Also uses the next two ports. "
+            "For playit.gg, create a TCP tunnel with port count 3 and this local port"
+        ),
+        default=5555,
+        min=1,
+        max=65532,
     )  # type:ignore
     host_use_server_password: bpy.props.BoolProperty(
         name="use_server_password",
@@ -251,8 +256,13 @@ class SessionPrefs(bpy.types.AddonPreferences):
         update=update_directory)  # type:ignore
     connection_timeout: bpy.props.IntProperty(
         name='connection timeout',
-        description='connection timeout before disconnection',
-        default=5000
+        description=(
+            "Timeout in milliseconds for auth, ping/latency kick, and server TTL. "
+            "Increase for slow connections and large scene syncs"
+        ),
+        default=5000,
+        min=1000,
+        max=600000,
     )  # type:ignore
     ping_timeout: bpy.props.IntProperty(
         name='ping timeout',
@@ -264,6 +274,16 @@ class SessionPrefs(bpy.types.AddonPreferences):
         name='depsgraph update rate (s)',
         description='Dependency graph uppdate rate (s)',
         default=1
+    )  # type:ignore
+    apply_batch_size: bpy.props.IntProperty(
+        name='apply batch size',
+        description=(
+            "How many datablocks to apply to Blender per tick after fetching. "
+            "Lower values are safer for large scenes"
+        ),
+        default=5,
+        min=1,
+        max=100,
     )  # type:ignore
     clear_memory_filecache: bpy.props.BoolProperty(
         name="Clear memory filecache",
@@ -305,7 +325,7 @@ class SessionPrefs(bpy.types.AddonPreferences):
         description="Adjust the session widget horizontal position",
         min=1,
         max=90,
-        default=1,
+        default=2,
         step=1,
         subtype='PERCENTAGE',
     )  # type:ignore
@@ -314,7 +334,7 @@ class SessionPrefs(bpy.types.AddonPreferences):
         description="Adjust the session widget vertical position",
         min=1,
         max=94,
-        default=1,
+        default=6,
         step=1,
         subtype='PERCENTAGE',
     )  # type:ignore
@@ -498,6 +518,8 @@ class SessionPrefs(bpy.types.AddonPreferences):
                     warning.label(text="Don't use this with heavy meshes !", icon='ERROR')
                     row = box.row()
                 row.prop(self, "depsgraph_update_rate", text="Apply delay")
+                row = box.row()
+                row.prop(self, "apply_batch_size", text="Apply batch size")
 
             # CACHE SETTINGS
             box = grid.box()
@@ -520,6 +542,13 @@ class SessionPrefs(bpy.types.AddonPreferences):
                 row = box.row()
                 row.label(text="Log level:")
                 row.prop(self, 'logging_level', text="")
+                row = box.row()
+                row.operator("wm.session_view_log", text="View Log", icon='TEXT')
+                row.operator(
+                    "wm.session_view_log",
+                    text="Open Log File",
+                    icon='FILE_FOLDER',
+                ).open_external = True
 
     def generate_supported_types(self):
         self.supported_datablocks.clear()
@@ -640,6 +669,17 @@ class SessionProps(bpy.types.PropertyGroup):
         name="Show session status ",
         description="Show session status on the viewport",
         default=True,
+    )  # type:ignore
+    presence_show_material_fetch_status: bpy.props.BoolProperty(
+        name="Show material fetch progress",
+        description="Show material fetch progress in the viewport when using Material or Rendered shading",
+        default=True,
+    )  # type:ignore
+    textures_fetch_enabled: bpy.props.BoolProperty(
+        name="Textures fetch enabled",
+        description="Set when the user switches to Material or Rendered viewport shading",
+        default=False,
+        options={'HIDDEN'},
     )  # type:ignore
     filter_owned: bpy.props.BoolProperty(
         name="filter_owned",

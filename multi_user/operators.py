@@ -19,6 +19,7 @@
 import gzip
 import logging
 import os
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -34,13 +35,15 @@ import bpy
 import mathutils
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from replication import porcelain
-from replication.constants import FETCHED, RP_COMMON, STATE_ACTIVE
+from replication.constants import FETCHED, RP_COMMON, STATE_ACTIVE, STATE_INITIAL
+from replication.exception import NonAuthorizedOperationError
 from replication.interface import session
 from replication.repository import Repository
 
 from . import bl_types, timers, utils
+from .bl_types.bl_material import reset_node_tree_finalize_state
 from .handlers import on_scene_update
-from .presence import (SessionStatusWidget, bbox_from_obj,
+from .presence import (SessionStatusWidget, MaterialsFetchWidget, bbox_from_obj,
                        refresh_sidebar_view, presence_viewer, view3d_find)
 from .timers import timers_registry
 
@@ -168,30 +171,15 @@ def initialize_session():
 
     if not runtime_settings.is_host:
         logging.info("Intializing the scene")
-        # Step 1: Constrect nodes
-        logging.info("Instantiating nodes")
-        for node in session.repository.index_sorted:
-            node_ref = session.repository.graph.get(node)
-            if node_ref is None:
-                logging.error(f"Can't construct node {node}")
-            elif node_ref.state == FETCHED:
-                node_ref.instance = session.repository.rdp.resolve(node_ref.data)
-                if node_ref.instance is None:
-                    node_ref.instance = session.repository.rdp.construct(node_ref.data)
-                    node_ref.instance.uuid = node_ref.uuid
-
-        # Step 2: Load nodes
-        logging.info("Applying nodes")
-        for node in session.repository.heads:
-            porcelain.apply(session.repository, node)
+        # Construct/apply deferred to ApplyTimer (geometry first, textures on demand)
 
     logging.info("Registering timers")
     # Step 4: Register blender timers
     for d in deleyables:
         d.register()
 
-    # Step 5: Clearing history
-    utils.flush_history()
+    # Step 5: Clearing history (deferred to avoid UI freeze on join)
+    utils.schedule_flush_history()
 
     # Step 6: Launch deps graph update handling
     bpy.app.handlers.depsgraph_update_post.append(on_scene_update)
@@ -202,6 +190,16 @@ def on_connection_end(reason="none"):
     """Session connection finished handler
     """
     global deleyables, stop_modal_executor
+
+    utils.network_log(logging.INFO, "session disconnected, reason: %s", reason)
+    utils.clear_connected_session_info()
+    utils.reset_textures_fetch_state()
+    reset_node_tree_finalize_state()
+    if "server not found" in reason.lower():
+        utils.network_log(
+            logging.ERROR,
+            "Auth timed out with no server reply. Re-check the server address and port in the preset.",
+        )
 
     # Step 1: Unregister blender timers
     for d in deleyables:
@@ -218,6 +216,7 @@ def on_connection_end(reason="none"):
 
     presence_viewer.clear_widgets()
     presence_viewer.add_widget("session_status", SessionStatusWidget())
+    presence_viewer.add_widget("material_fetch", MaterialsFetchWidget())
 
     # Step 3: remove file handled
     logger = logging.getLogger()
@@ -238,12 +237,27 @@ def setup_logging():
     """
     settings = utils.get_preferences()
     logger = logging.getLogger()
-    if len(logger.handlers) == 1:
-        formatter = logging.Formatter(
-            fmt='%(asctime)s CLIENT %(levelname)-8s %(message)s',
-            datefmt='%H:%M:%S'
-        )
+    network_logger = utils.get_network_logger()
+    network_logger.setLevel(logging.DEBUG)
 
+    formatter = logging.Formatter(
+        fmt='%(asctime)s %(name)s %(levelname)-8s %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
+    has_console = any(
+        isinstance(handler, logging.StreamHandler)
+        and handler.stream in (sys.stdout, sys.stderr)
+        for handler in logger.handlers
+    )
+    if not has_console:
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(formatter)
+        logger.addHandler(console)
+
+    if len(logger.handlers) == 1 or not any(
+        isinstance(handler, logging.FileHandler) for handler in logger.handlers
+    ):
         start_time = datetime.now().strftime('%Y_%m_%d_%H-%M-%S')
         log_directory = os.path.join(
             settings.cache_directory,
@@ -252,13 +266,15 @@ def setup_logging():
         os.makedirs(settings.cache_directory, exist_ok=True)
 
         handler = logging.FileHandler(log_directory, mode='w')
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
+        utils.set_session_log_file(log_directory)
+        utils.network_log(logging.INFO, "session log file: %s", log_directory)
 
-        for handler in logger.handlers:
-            if isinstance(handler, logging.NullHandler):
-                continue
-
-            handler.setFormatter(formatter)
+    for handler in logger.handlers:
+        if isinstance(handler, logging.NullHandler):
+            continue
+        handler.setFormatter(formatter)
 
 
 def setup_timer():
@@ -267,11 +283,15 @@ def setup_timer():
     settings = utils.get_preferences()
     deleyables.append(timers.ClientUpdate())
     deleyables.append(timers.DynamicRightSelectTimer())
-    deleyables.append(timers.ApplyTimer(timeout=settings.depsgraph_update_rate))
+    apply_timer = timers.ApplyTimer(timeout=settings.depsgraph_update_rate)
+    apply_timer.register()
+    deleyables.append(apply_timer)
 
     session_update = timers.SessionStatusUpdate()
     session_user_sync = timers.SessionUserSync()
     session_listen = timers.SessionListenTimer(timeout=0.001)
+    timers.SessionListenTimer._last_session_state = STATE_INITIAL
+    timers.SessionListenTimer._last_fetch_progress = (-1, -1)
 
     session_listen.register()
     session_update.register()
@@ -310,6 +330,7 @@ class SessionJoinOperator(bpy.types.Operator):
         settings = utils.get_preferences()
         users = bpy.data.window_managers['WinMan'].online_users
         active_server = get_active_server_preset(context)
+        settings.server_name = active_server.server_name
         admin_pass = active_server.admin_password if active_server.use_admin_password else None
         server_pass = active_server.server_password if active_server.use_server_password else ''
 
@@ -337,6 +358,14 @@ class SessionJoinOperator(bpy.types.Operator):
             utils.clean_scene()
 
         try:
+            utils.set_connected_session_info(
+                active_server.ip,
+                active_server.port,
+                server_name=active_server.server_name,
+                use_server_password=active_server.use_server_password,
+                use_admin_password=active_server.use_admin_password,
+                is_host=False,
+            )
             porcelain.remote_add(
                 repo,
                 'origin',
@@ -344,6 +373,13 @@ class SessionJoinOperator(bpy.types.Operator):
                 active_server.port,
                 server_password=server_pass,
                 admin_password=admin_pass)
+            utils.network_log(
+                logging.INFO,
+                "connecting as %s to origin %s:%s",
+                settings.username,
+                active_server.ip,
+                active_server.port,
+            )
             session.connect(
                 repository=repo,
                 timeout=settings.connection_timeout,
@@ -351,9 +387,11 @@ class SessionJoinOperator(bpy.types.Operator):
                 admin_password=admin_pass,
                 subprocess_python_args=bpy.app.python_args,
             )
+            utils.network_log(logging.INFO, "session.connect() returned, state=%s", session.state)
         except Exception as e:
             self.report({'ERROR'}, str(e))
             logging.error(str(e))
+            utils.network_log(logging.ERROR, "connect exception: %s", e)
 
         # Background client updates service
         setup_timer()
@@ -375,6 +413,7 @@ class SessionHostOperator(bpy.types.Operator):
 
         settings = utils.get_preferences()
         users = bpy.data.window_managers['WinMan'].online_users
+        settings.server_name = "Local host"
         admin_pass = settings.host_admin_password if settings.host_use_admin_password else None
         server_pass = settings.host_server_password if settings.host_use_server_password else ''
 
@@ -403,6 +442,14 @@ class SessionHostOperator(bpy.types.Operator):
             utils.clean_scene()
 
         try:
+            utils.set_connected_session_info(
+                "127.0.0.1",
+                settings.host_port,
+                server_name="Local host",
+                use_server_password=settings.host_use_server_password,
+                use_admin_password=settings.host_use_admin_password,
+                is_host=True,
+            )
             # Init repository
             for scene in bpy.data.scenes:
                 porcelain.add(repo, scene)
@@ -1110,6 +1157,15 @@ class SessionPresetServerAdd(bpy.types.Operator):
         settings = utils.get_preferences()
         existing_preset = settings.get_server_preset(self.server_name)
 
+        host, port = utils.normalize_server_address(self.ip)
+        if port is not None:
+            self.port = port
+        validated_host = utils.validate_server_host(host)
+        if not validated_host:
+            self.report({'ERROR'}, "Invalid server address")
+            return {'CANCELLED'}
+        self.ip = validated_host
+
         new_server = existing_preset if existing_preset else settings.server_preset.add()
         new_server.name = str(uuid4())
         new_server.server_name = self.server_name
@@ -1220,12 +1276,115 @@ class RefreshServerStatus(bpy.types.Operator):
         settings = utils.get_preferences()
 
         for server in settings.server_preset:
-            infos = porcelain.request_session_info(f"{server.ip}:{server.port}", timeout=settings.ping_timeout)
+            utils.network_log(
+                logging.INFO,
+                "refreshing server preset %s (%s:%s)",
+                server.server_name,
+                server.ip,
+                server.port,
+            )
+            infos = porcelain.request_session_info(
+                f"{server.ip}:{server.port}",
+                timeout=settings.ping_timeout,
+            )
             server.is_online = True if infos else False
             if server.is_online:
                 server.is_private = infos.get("private")
+                utils.network_log(logging.INFO, "preset %s online: %s", server.server_name, infos)
+            else:
+                utils.network_log(logging.ERROR, "preset %s offline", server.server_name)
 
         return {'FINISHED'}
+
+
+class SessionReleaseLocksOperator(bpy.types.Operator):
+    """Unlock all datablocks currently owned by this user"""
+    bl_idname = "wm.session_release_locks"
+    bl_label = "Release my locks"
+    bl_description = "Unlock all datablocks owned by you so others can edit them"
+
+    @classmethod
+    def poll(cls, context):
+        return session and session.state == STATE_ACTIVE
+
+    def execute(self, context):
+        settings = utils.get_preferences()
+        owned_keys = [
+            key
+            for key, node in session.repository.graph.items()
+            if node.owner == settings.username
+        ]
+        if not owned_keys:
+            self.report({'INFO'}, "You do not own any locked datablocks")
+            return {'FINISHED'}
+
+        try:
+            porcelain.unlock(
+                session.repository,
+                owned_keys,
+                ignore_warnings=True,
+                affect_dependencies=True,
+            )
+        except NonAuthorizedOperationError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Released {len(owned_keys)} datablock(s)")
+        return {'FINISHED'}
+
+
+class SessionViewLogOperator(bpy.types.Operator):
+    """Open the Multi-User session log in the Text Editor"""
+    bl_idname = "wm.session_view_log"
+    bl_label = "View Log"
+    bl_description = (
+        "Open the session log in Blender's Text Editor "
+        "(latest log file, or live network buffer if none exists yet)"
+    )
+
+    open_external: bpy.props.BoolProperty(
+        name="Open in external app",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def execute(self, context):
+        settings = utils.get_preferences()
+        log_path = utils.get_active_session_log_path()
+        if not log_path:
+            log_path = utils.find_latest_session_log(settings.cache_directory)
+
+        if log_path and Path(log_path).is_file():
+            content = utils.read_log_file(log_path)
+            title = Path(log_path).name
+            if self.open_external:
+                utils.open_log_externally(log_path)
+                self.report({'INFO'}, f"Opened log file: {log_path}")
+            else:
+                utils.open_log_in_text_editor(context, content, title, log_path)
+                self.report({'INFO'}, f"Log loaded in Text Editor ({log_path})")
+            return {'FINISHED'}
+
+        buffer_text = utils.get_network_log_buffer_text()
+        if buffer_text.strip():
+            utils.open_log_in_text_editor(
+                context,
+                buffer_text + "\n",
+                "Multi-User Log (live)",
+                None,
+            )
+            self.report(
+                {'INFO'},
+                "No log file yet — showing live network log buffer",
+            )
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, "No logs yet. Connect or host a session first.")
+        return {'CANCELLED'}
 
 
 class GetDoc(bpy.types.Operator):
@@ -1296,6 +1455,8 @@ classes = (
     SessionPresetServerEdit,
     SessionPresetServerRemove,
     RefreshServerStatus,
+    SessionReleaseLocksOperator,
+    SessionViewLogOperator,
     GetDoc,
     FirstLaunch,
 )

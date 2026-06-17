@@ -572,6 +572,9 @@ class Loader:
                 return
 
     def _load_identity(self, element, dump):
+        rna_property = element.bl_rna_property
+        if isinstance(rna_property, T.EnumProperty) and dump == "":
+            return
         element.write(dump)
 
     def _load_array(self, element, dump):

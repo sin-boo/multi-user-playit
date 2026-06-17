@@ -29,7 +29,9 @@ from gpu_extras.batch import batch_for_shader
 from replication.constants import STATE_ACTIVE, STATE_INITIAL
 from replication.interface import session
 
-from .utils import find_from_attr, get_preferences, get_state_str
+from .utils import (find_from_attr, get_asset_sync_progress, get_preferences,
+                    get_state_str, is_texture_shading_active, printProgressBar,
+                    textures_fetch_enabled)
 
 # Helper functions
 
@@ -525,6 +527,58 @@ class SessionStatusWidget(Widget):
         blf.draw(0,  state_str)
 
 
+class MaterialsFetchWidget(Widget):
+    draw_type = 'POST_PIXEL'
+
+    def __init__(self):
+        self.preferences = get_preferences()
+
+    @property
+    def settings(self):
+        return getattr(bpy.context.window_manager, 'session', None)
+
+    def poll(self):
+        if not self.settings or not self.settings.enable_presence:
+            return False
+        if not getattr(self.settings, 'presence_show_material_fetch_status', True):
+            return False
+        if session.state != STATE_ACTIVE:
+            return False
+        if not textures_fetch_enabled(bpy.context):
+            return False
+        if not is_texture_shading_active(bpy.context):
+            return False
+        applied, total = get_asset_sync_progress()
+        return total > 0 and applied < total
+
+    def draw(self):
+        text_scale = self.preferences.presence_hud_scale
+        ui_scale = bpy.context.preferences.view.ui_scale
+        font_size = int(text_scale * ui_scale)
+        color = [1, 0.85, 0.2, 1]
+        area = bpy.context.area
+        if area is None:
+            return
+        hpos = (self.preferences.presence_hud_hpos * area.width) / 100
+        vpos = (self.preferences.presence_hud_vpos * area.height) / 100
+        line_height = font_size + 6
+
+        applied, total = get_asset_sync_progress()
+        progress = printProgressBar(applied, total, length=20)
+
+        blf.enable(0)
+        blf.position(0, hpos, vpos + line_height * 2, 0)
+        blf.size(0, font_size)
+        blf.color(0, color[0], color[1], color[2], color[3])
+        blf.draw(0, "Fetching materials")
+
+        blf.position(0, hpos, vpos + line_height, 0)
+        blf.size(0, font_size)
+        blf.color(0, color[0], color[1], color[2], color[3])
+        blf.draw(0, progress)
+        blf.disable(0)
+
+
 class DrawFactory(object):
     def __init__(self):
         self.post_view_handle = None
@@ -596,6 +650,7 @@ def register():
     global presence_viewer
     presence_viewer.register_handlers()
     presence_viewer.add_widget("session_status", SessionStatusWidget())
+    presence_viewer.add_widget("material_fetch", MaterialsFetchWidget())
 
 
 def unregister():

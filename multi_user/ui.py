@@ -19,7 +19,9 @@
 import bpy
 import bpy.utils.previews
 
-from .utils import get_version, get_preferences, get_expanded_icon, get_folder_size, get_state_str
+from .utils import (get_version, get_preferences, get_expanded_icon, get_folder_size,
+                    get_state_str, get_asset_sync_progress,
+                    printProgressBar)
 from replication.constants import (
     ADDED,
     ERROR,
@@ -47,27 +49,6 @@ ICONS_PROP_STATES = [
     "TRIA_UP",  # CHANGED
     "ERROR",  # ERROR
 ]
-
-
-def printProgressBar(iteration, total, prefix='', suffix='', decimals=1, length=100, fill='█', fill_empty='  '):
-    """
-    Call in a loop to create terminal progress bar
-    @params:
-        iteration   - Required  : current iteration (Int)
-        total       - Required  : total iterations (Int)
-        prefix      - Optional  : prefix string (Str)
-        suffix      - Optional  : suffix string (Str)
-        decimals    - Optional  : positive number of decimals in percent complete (Int)
-        length      - Optional  : character length of bar (Int)
-        fill        - Optional  : bar fill character (Str)
-    From here:
-    https://gist.github.com/greenstick/b23e475d2bfdc3a82e34eaa1f6781ee4
-    """
-    if total == 0:
-        return ""
-    filledLength = int(length * iteration // total)
-    bar = fill * filledLength + fill_empty * (length - filledLength)
-    return f"{prefix} |{bar}| {iteration}/{total}{suffix}"
 
 
 def get_mode_icon(mode_name: str) -> str:
@@ -135,7 +116,10 @@ class SESSION_PT_settings(bpy.types.Panel):
             else:
                 connection_icon = waiting_icon
 
-            layout.label(text=f"{str(settings.server_name)} - {get_state_str(cli_state)}", icon_value=connection_icon.icon_id)
+            layout.label(
+                text=f"Multi-user - v{get_version()}",
+                icon_value=connection_icon.icon_id,
+            )
         else:
             layout.label(text=f"Multi-user - v{get_version()}", icon="ANTIALIASED")
 
@@ -254,6 +238,54 @@ class SESSION_PT_settings(bpy.types.Panel):
                             progress['total'],
                             length=16
                         ))
+
+                    if current_state == STATE_ACTIVE:
+                        runtime = context.window_manager.session
+                        if runtime.textures_fetch_enabled:
+                            applied, total = get_asset_sync_progress()
+                            if total > 0 and applied < total:
+                                row = layout.row()
+                                row.label(text="Fetching materials")
+                                row = layout.row()
+                                mat_box = row.box()
+                                mat_box.label(text=printProgressBar(
+                                    applied,
+                                    total,
+                                    length=16,
+                                ))
+
+
+class SESSION_PT_session_tools(bpy.types.Panel):
+    bl_idname = "MULTIUSER_SESSION_TOOLS_PT_panel"
+    bl_label = "Session tools"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_parent_id = 'MULTIUSER_SETTINGS_PT_panel'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return session and session.state != STATE_INITIAL
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon='CONSOLE')
+
+    def draw(self, context):
+        layout = self.layout
+
+        row = layout.row(align=True)
+        row.operator("wm.session_view_log", icon='TEXT', text="View Log")
+
+        row = layout.row(align=True)
+        row.operator(
+            "wm.session_view_log",
+            text="Open Log File",
+            icon='FILE_FOLDER',
+        ).open_external = True
+
+        if session.state == STATE_ACTIVE:
+            layout.separator()
+            layout.operator("wm.session_release_locks", icon='DECORATE_UNLOCKED', text="Release my locks")
 
 
 class SESSION_PT_host_settings(bpy.types.Panel):
@@ -378,6 +410,8 @@ class SESSION_PT_advanced_settings(bpy.types.Panel):
                 warning.label(text="Don't use this with heavy meshes !", icon='ERROR')
                 replication_section_row = replication_section.row()
             replication_section_row.prop(settings, "depsgraph_update_rate", text="Apply delay")
+            replication_section_row = replication_section.row()
+            replication_section_row.prop(settings, "apply_batch_size", text="Apply batch")
 
         # ADVANCED CACHE
         cache_section = layout.row().box()
@@ -410,6 +444,13 @@ class SESSION_PT_advanced_settings(bpy.types.Panel):
             log_section_row = log_section.row()
             log_section_row.label(text="Log level:")
             log_section_row.prop(settings, 'logging_level', text="")
+            log_section_row = log_section.row()
+            log_section_row.operator("wm.session_view_log", text="View Log", icon='TEXT')
+            log_section_row.operator(
+                "wm.session_view_log",
+                text="Open Log File",
+                icon='FILE_FOLDER',
+            ).open_external = True
 
 class SESSION_PT_user(bpy.types.Panel):
     bl_idname = "MULTIUSER_USER_PT_panel"
@@ -750,6 +791,8 @@ class VIEW3D_PT_overlay_session(bpy.types.Panel):
             text_scale.active = settings.presence_show_session_status
             text_scale.prop(pref, "presence_hud_scale", expand=True)
 
+        col.prop(settings, "presence_show_material_fetch_status")
+
 
 class SESSION_UL_network(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):
@@ -777,6 +820,7 @@ classes = (
     SESSION_UL_users,
     SESSION_UL_network,
     SESSION_PT_settings,
+    SESSION_PT_session_tools,
     SESSION_PT_host_settings,
     SESSION_PT_advanced_settings,
     SESSION_PT_user,

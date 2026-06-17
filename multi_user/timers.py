@@ -20,12 +20,14 @@ import sys
 import traceback
 import bpy
 from replication.constants import (FETCHED, RP_COMMON, STATE_ACTIVE,
-                                   STATE_LOBBY)
+                                   STATE_INITIAL, STATE_LOBBY, STATE_SYNCING,
+                                   STATE_SRV_SYNC, STATE_WAITING)
 from replication.exception import NonAuthorizedOperationError
 from replication.interface import session
 from replication import porcelain
 
 from . import utils
+from .bl_types.bl_material import maybe_finalize_node_trees
 from .presence import (UserFrustumWidget, UserNameWidget, UserModeWidget, UserSelectionWidget,
                        generate_user_camera, get_view_matrix, refresh_3d_view,
                        refresh_sidebar_view, presence_viewer)
@@ -50,6 +52,8 @@ class Timer(object):
     Run a bpy.app.Timer in the background looping at the given rate
     """
 
+    disconnect_on_error = False
+
     def __init__(self, timeout=10, id=None):
         self._timeout = timeout
         self.is_running = False
@@ -73,9 +77,20 @@ class Timer(object):
             self.execute()
         except Exception as e:
             logging.error(e)
-            self.unregister()
             traceback.print_exc()
-            session.disconnect(reason=f"Error during timer {self.id} execution")
+            utils.network_log(
+                logging.ERROR,
+                "Timer %s failed: %s: %s",
+                self.id,
+                type(e).__name__,
+                e,
+            )
+            utils.network_log(logging.ERROR, traceback.format_exc())
+            self.unregister()
+            if self.disconnect_on_error and session.state != STATE_INITIAL:
+                session.disconnect(
+                    reason=f"Timer {self.id}: {type(e).__name__}: {e}"
+                )
         else:
             if self.is_running:
                 return self._timeout
@@ -106,38 +121,124 @@ class SessionBackupTimer(Timer):
 
 
 class SessionListenTimer(Timer):
+    _last_session_state = STATE_INITIAL
+    _last_fetch_progress = (-1, -1)
+    disconnect_on_error = True
+
     def execute(self):
+        current_state = session.state
+        if current_state != SessionListenTimer._last_session_state:
+            utils.log_session_state_change(
+                SessionListenTimer._last_session_state,
+                current_state,
+            )
+            SessionListenTimer._last_session_state = current_state
+        if current_state in (STATE_SYNCING, STATE_SRV_SYNC, STATE_WAITING):
+            progress = session.state_progress
+            key = (progress.get('current', -1), progress.get('total', -1))
+            if key != SessionListenTimer._last_fetch_progress:
+                SessionListenTimer._last_fetch_progress = key
+                utils.network_log(
+                    logging.INFO,
+                    "fetch progress %s/%s",
+                    key[0],
+                    key[1],
+                )
         session.listen()
 
 
 class ApplyTimer(Timer):
     def execute(self):
-        if session and session.state == STATE_ACTIVE:
-            for node in session.repository.graph.keys():
-                node_ref = session.repository.graph.get(node)
+        if not session or session.state != STATE_ACTIVE:
+            return
 
-                if node_ref.state == FETCHED:
-                    try:
-                        shared_data.session.applied_updates.append(node)
-                        porcelain.apply(session.repository, node)
-                    except Exception:
-                        logging.error(f"Fail to apply {node_ref.uuid}")
-                        traceback.print_exc()
-                    else:
-                        impl = session.repository.rdp.get_implementation(node_ref.instance)
-                        if impl.bl_reload_parent:
-                            for parent in session.repository.graph.get_parents(node):
-                                logging.debug("Refresh parent {node}")
-                                porcelain.apply(
-                                    session.repository,
-                                    parent.uuid,
-                                    force=True
-                                )
-                        if hasattr(impl, 'bl_reload_child') and impl.bl_reload_child:
-                            for dep in node_ref.dependencies:
-                                porcelain.apply(session.repository,
-                                                dep,
-                                                force=True)
+        utils.update_textures_fetch_on_shading_change(bpy.context)
+        textures_enabled = utils.textures_fetch_enabled(bpy.context)
+
+        settings = utils.get_preferences()
+        batch_size = settings.apply_batch_size if settings else 10
+        applied = 0
+
+        candidates = []
+        for node in session.repository.graph.keys():
+            node_ref = session.repository.graph.get(node)
+            if node_ref is None or node_ref.state != FETCHED:
+                continue
+            type_id = node_ref.data.get('type_id') if node_ref.data else None
+            if utils.is_deferred_asset_type(type_id) and not textures_enabled:
+                continue
+            candidates.append((type_id in utils.ASSET_TYPE_IDS, node))
+
+        candidates.sort(key=lambda item: item[0])
+
+        for _, node in candidates:
+            if applied >= batch_size:
+                break
+
+            node_ref = session.repository.graph.get(node)
+            if node_ref is None or node_ref.instance is None:
+                if node_ref and node_ref.data:
+                    node_ref.instance = session.repository.rdp.resolve(node_ref.data)
+                    if node_ref.instance is None:
+                        node_ref.instance = session.repository.rdp.construct(node_ref.data)
+                    if node_ref.instance is not None:
+                        node_ref.instance.uuid = node_ref.uuid
+                if node_ref is None or node_ref.instance is None:
+                    continue
+
+            try:
+                shared_data.session.applied_updates.append(node)
+                porcelain.apply(session.repository, node)
+            except Exception:
+                logging.error(f"Fail to apply {node_ref.uuid}")
+                traceback.print_exc()
+                utils.network_log(
+                    logging.ERROR,
+                    "Failed to apply node %s",
+                    node_ref.uuid,
+                )
+            else:
+                applied += 1
+                impl = session.repository.rdp.get_implementation(node_ref.instance)
+                if impl.bl_reload_parent:
+                    for parent in session.repository.graph.get_parents(node):
+                        logging.debug("Refresh parent {node}")
+                        try:
+                            porcelain.apply(
+                                session.repository,
+                                parent.uuid,
+                                force=True
+                            )
+                        except Exception:
+                            logging.error(f"Fail to refresh parent {parent.uuid}")
+                            traceback.print_exc()
+                if hasattr(impl, 'bl_reload_child') and impl.bl_reload_child:
+                    for dep in node_ref.dependencies:
+                        try:
+                            porcelain.apply(session.repository,
+                                            dep,
+                                            force=True)
+                        except Exception:
+                            logging.error(f"Fail to refresh child {dep}")
+                            traceback.print_exc()
+
+        if applied:
+            remaining = sum(
+                1 for node in session.repository.graph.values()
+                if node.state == FETCHED
+            )
+            utils.network_log(
+                logging.DEBUG,
+                "Applied %s datablock(s), %s remaining",
+                applied,
+                remaining,
+            )
+
+        try:
+            maybe_finalize_node_trees(session.repository, textures_enabled=textures_enabled)
+        except Exception:
+            logging.error("Failed to finalize node trees")
+            traceback.print_exc()
 
 
 class AnnotationUpdates(Timer):
@@ -194,95 +295,94 @@ class DynamicRightSelectTimer(Timer):
     def execute(self):
         settings = utils.get_preferences()
 
-        if session and session.state == STATE_ACTIVE:
-            # Find user
-            if self._user is None:
-                self._user = session.online_users.get(settings.username)
+        if not session or session.state != STATE_ACTIVE:
+            return
 
-            if self._user:
-                current_selection = set(utils.get_selected_objects(
-                    bpy.context.scene,
-                    bpy.data.window_managers['WinMan'].windows[0].view_layer
-                ))
-                if current_selection != self._last_selection:
-                    to_lock = list(current_selection.difference(self._last_selection))
-                    to_release = list(self._last_selection.difference(current_selection))
-                    instances_to_lock = list()
+        if self._user is None:
+            self._user = session.online_users.get(settings.username)
 
-                    for node_id in to_lock:
-                        node = session.repository.graph.get(node_id)
-                        if node and hasattr(node,'data'):
-                            instance_mode = node.data.get('instance_type')
-                            if instance_mode and instance_mode == 'COLLECTION':
-                                to_lock.remove(node_id)
-                                instances_to_lock.append(node_id)
-                    if instances_to_lock:
-                        try:
-                            porcelain.lock(
-                                session.repository,
-                                instances_to_lock,
-                                ignore_warnings=True,
-                                affect_dependencies=False,
-                            )
-                        except NonAuthorizedOperationError as e:
-                            logging.warning(e)
+        if self._user:
+            current_selection = set(utils.get_selected_objects(
+                bpy.context.scene,
+                bpy.data.window_managers['WinMan'].windows[0].view_layer
+            ))
+            if current_selection != self._last_selection:
+                to_lock = list(current_selection.difference(self._last_selection))
+                to_release = list(self._last_selection.difference(current_selection))
+                instances_to_lock = list()
 
-                    if to_release:
+                for node_id in to_lock:
+                    node = session.repository.graph.get(node_id)
+                    if node and hasattr(node, 'data'):
+                        instance_mode = node.data.get('instance_type')
+                        if instance_mode and instance_mode == 'COLLECTION':
+                            to_lock.remove(node_id)
+                            instances_to_lock.append(node_id)
+                if instances_to_lock:
+                    try:
+                        porcelain.lock(
+                            session.repository,
+                            instances_to_lock,
+                            ignore_warnings=True,
+                            affect_dependencies=False,
+                        )
+                    except NonAuthorizedOperationError as e:
+                        logging.warning(e)
+
+                if to_release:
+                    try:
+                        porcelain.unlock(
+                            session.repository,
+                            to_release,
+                            ignore_warnings=True,
+                            affect_dependencies=True,
+                        )
+                    except NonAuthorizedOperationError as e:
+                        logging.warning(e)
+                if to_lock:
+                    try:
+                        porcelain.lock(
+                            session.repository,
+                            to_lock,
+                            ignore_warnings=True,
+                            affect_dependencies=True,
+                        )
+                    except NonAuthorizedOperationError as e:
+                        logging.warning(e)
+
+                self._last_selection = current_selection
+
+                user_metadata = {
+                    'selected_objects': current_selection
+                }
+
+                porcelain.update_user_metadata(session.repository, user_metadata)
+                logging.debug("Update selection")
+
+                if len(current_selection) == 0:
+                    owned_keys = [
+                        k
+                        for k, v in session.repository.graph.items()
+                        if v.owner == settings.username
+                    ]
+                    if owned_keys:
                         try:
                             porcelain.unlock(
                                 session.repository,
-                                to_release,
-                                ignore_warnings=True,
-                                affect_dependencies=True,
-                            )
-                        except NonAuthorizedOperationError as e:
-                            logging.warning(e)
-                    if to_lock:
-                        try:
-                            porcelain.lock(
-                                session.repository,
-                                to_lock,
+                                owned_keys,
                                 ignore_warnings=True,
                                 affect_dependencies=True,
                             )
                         except NonAuthorizedOperationError as e:
                             logging.warning(e)
 
-                    self._last_selection = current_selection
-
-                    user_metadata = {
-                        'selected_objects': current_selection
-                    }
-
-                    porcelain.update_user_metadata(session.repository, user_metadata)
-                    logging.debug("Update selection")
-
-                    # Fix deselection until right managment refactoring (with Roles concepts)
-                    if len(current_selection) == 0:
-                        owned_keys = [
-                            k
-                            for k, v in session.repository.graph.items()
-                            if v.owner == settings.username
-                        ]
-                        if owned_keys:
-                            try:
-                                porcelain.unlock(
-                                    session.repository,
-                                    owned_keys,
-                                    ignore_warnings=True,
-                                    affect_dependencies=True,
-                                )
-                            except NonAuthorizedOperationError as e:
-                                logging.warning(e)
-
-            # Objects selectability
-            for obj in bpy.data.objects:
-                object_uuid = getattr(obj, 'uuid', None)
-                if object_uuid:
-                    is_selectable = not session.repository.is_node_readonly(object_uuid)
-                    if obj.hide_select != is_selectable:
-                        obj.hide_select = is_selectable
-                        shared_data.session.applied_updates.append(object_uuid)
+        for obj in bpy.data.objects:
+            object_uuid = getattr(obj, 'uuid', None)
+            if object_uuid:
+                is_selectable = not session.repository.is_node_readonly(object_uuid)
+                if obj.hide_select != is_selectable:
+                    obj.hide_select = is_selectable
+                    shared_data.session.applied_updates.append(object_uuid)
 
 
 class ClientUpdate(Timer):
@@ -293,6 +393,11 @@ class ClientUpdate(Timer):
 
     def execute(self):
         settings = utils.get_preferences()
+
+        if not session or not presence_viewer:
+            return
+        if session.state not in [STATE_ACTIVE, STATE_LOBBY]:
+            return
 
         if session and presence_viewer:
             if session.state in [STATE_ACTIVE, STATE_LOBBY]:
@@ -353,11 +458,36 @@ class ClientUpdate(Timer):
 
 
 class SessionStatusUpdate(Timer):
+    _last_asset_progress = (-1, -1, False)
+    _last_shading_active = False
+    _fast_refresh = False
+
     def __init__(self, timeout=1):
         super().__init__(timeout)
 
     def execute(self):
         refresh_sidebar_view()
+
+        utils.update_textures_fetch_on_shading_change(bpy.context)
+        textures_enabled = utils.textures_fetch_enabled(bpy.context)
+        applied, total = utils.get_asset_sync_progress()
+        shading_active = utils.is_texture_shading_active(bpy.context)
+        progress_key = (applied, total, textures_enabled)
+
+        if progress_key != SessionStatusUpdate._last_asset_progress or \
+                shading_active != SessionStatusUpdate._last_shading_active:
+            SessionStatusUpdate._last_asset_progress = progress_key
+            SessionStatusUpdate._last_shading_active = shading_active
+            refresh_3d_view()
+
+        pending_assets = textures_enabled and total > 0 and applied < total
+        pending = pending_assets
+        if pending and not SessionStatusUpdate._fast_refresh:
+            SessionStatusUpdate._fast_refresh = True
+            self._timeout = 0.25
+        elif not pending and SessionStatusUpdate._fast_refresh:
+            SessionStatusUpdate._fast_refresh = False
+            self._timeout = 1
 
 
 class SessionUserSync(Timer):
@@ -366,32 +496,35 @@ class SessionUserSync(Timer):
         self.settings = utils.get_preferences()
 
     def execute(self):
-        if session and presence_viewer:
-            # sync online users
-            session_users = session.online_users
-            ui_users = bpy.context.window_manager.online_users
+        if not session or not presence_viewer:
+            return
+        if session.state not in (STATE_ACTIVE, STATE_LOBBY):
+            return
 
-            for index, user in enumerate(ui_users):
-                if user.username not in session_users.keys() and \
-                        user.username != self.settings.username:
-                    presence_viewer.remove_widget(f"{user.username}_cam")
-                    presence_viewer.remove_widget(f"{user.username}_select")
-                    presence_viewer.remove_widget(f"{user.username}_name")
-                    presence_viewer.remove_widget(f"{user.username}_mode")
-                    ui_users.remove(index)
-                    break
+        session_users = session.online_users
+        ui_users = bpy.context.window_manager.online_users
 
-            for user in session_users:
-                if user not in ui_users:
-                    new_key = ui_users.add()
-                    new_key.name = user
-                    new_key.username = user
-                    if user != self.settings.username:
-                        presence_viewer.add_widget(
-                            f"{user}_cam", UserFrustumWidget(user))
-                        presence_viewer.add_widget(
-                            f"{user}_select", UserSelectionWidget(user))
-                        presence_viewer.add_widget(
-                            f"{user}_name", UserNameWidget(user))
-                        presence_viewer.add_widget(
-                            f"{user}_mode", UserModeWidget(user))
+        for index, user in enumerate(ui_users):
+            if user.username not in session_users.keys() and \
+                    user.username != self.settings.username:
+                presence_viewer.remove_widget(f"{user.username}_cam")
+                presence_viewer.remove_widget(f"{user.username}_select")
+                presence_viewer.remove_widget(f"{user.username}_name")
+                presence_viewer.remove_widget(f"{user.username}_mode")
+                ui_users.remove(index)
+                break
+
+        for user in session_users:
+            if user not in ui_users:
+                new_key = ui_users.add()
+                new_key.name = user
+                new_key.username = user
+                if user != self.settings.username:
+                    presence_viewer.add_widget(
+                        f"{user}_cam", UserFrustumWidget(user))
+                    presence_viewer.add_widget(
+                        f"{user}_select", UserSelectionWidget(user))
+                    presence_viewer.add_widget(
+                        f"{user}_name", UserNameWidget(user))
+                    presence_viewer.add_widget(
+                        f"{user}_mode", UserModeWidget(user))

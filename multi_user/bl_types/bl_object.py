@@ -147,6 +147,8 @@ def dump_modifier_geometry_node_props(modifier: bpy.types.Modifier) -> list:
             dump = None
             if isinstance(prop_value, bpy.types.ID):
                 dump = prop_value.uuid
+            elif isinstance(prop_value, bool):
+                dump = prop_value
             elif isinstance(prop_value, SUPPORTED_GEOMETRY_NODE_PARAMETERS):
                 dump = prop_value
             elif hasattr(prop_value, 'to_list'):
@@ -167,17 +169,29 @@ def load_modifier_geometry_node_props(dumped_modifier: dict, target_modifier: bp
     """
 
     for input_index, inpt in enumerate(get_node_group_properties_identifiers(target_modifier.node_group)):
+        if input_index >= len(dumped_modifier.get('props', [])):
+            break
         if inpt[0] not in target_modifier:
             continue
         dumped_value, dumped_type = dumped_modifier['props'][input_index]
-        if dumped_type in ['NodeSocketInt', 'NodeSocketFloat', 'NodeSocketString', 'NodeSocketBool']:
-            target_modifier[inpt[0]] = dumped_value
-        elif dumped_type in ['NodeSocketColor', 'NodeSocketVector']:
-            input_value = target_modifier[inpt[0]]
-            for index in range(len(input_value)):
-                input_value[index] = dumped_value[index]
-        elif dumped_type in ['NodeSocketCollection', 'NodeSocketObject', 'NodeSocketImage', 'NodeSocketTexture', 'NodeSocketMaterial']:
-            target_modifier[inpt[0]] = get_datablock_from_uuid(dumped_value, None)
+        try:
+            if dumped_type == 'NodeSocketBool':
+                target_modifier[inpt[0]] = bool(dumped_value)
+            elif dumped_type in ['NodeSocketInt', 'NodeSocketFloat', 'NodeSocketString']:
+                target_modifier[inpt[0]] = dumped_value
+            elif dumped_type in ['NodeSocketColor', 'NodeSocketVector']:
+                input_value = target_modifier[inpt[0]]
+                for index in range(len(input_value)):
+                    input_value[index] = dumped_value[index]
+            elif dumped_type in ['NodeSocketCollection', 'NodeSocketObject', 'NodeSocketImage', 'NodeSocketTexture', 'NodeSocketMaterial']:
+                target_modifier[inpt[0]] = get_datablock_from_uuid(dumped_value, None)
+        except Exception as e:
+            logging.warning(
+                "Geometry nodes modifier %s property %s not supported, skipping (%s)",
+                target_modifier.name,
+                inpt[0],
+                e,
+            )
 
 
 def load_pose(target_bone, data):
