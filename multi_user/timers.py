@@ -18,16 +18,22 @@
 import logging
 import sys
 import traceback
+import time
 import bpy
 from replication.constants import (FETCHED, RP_COMMON, STATE_ACTIVE,
                                    STATE_INITIAL, STATE_LOBBY, STATE_SYNCING,
-                                   STATE_SRV_SYNC, STATE_WAITING)
+                                   STATE_SRV_SYNC, STATE_WAITING, UP)
 from replication.exception import NonAuthorizedOperationError
 from replication.interface import session
 from replication import porcelain
 
 from . import utils
-from .bl_types.bl_material import maybe_finalize_node_trees
+from .bl_types.bl_material import (
+    maybe_finalize_node_trees,
+    refresh_mesh_material_slots,
+)
+from .bl_types.bl_image import reload_images_waiting_for_files
+from .bl_types.bl_file import is_replicated_file
 from .presence import (UserFrustumWidget, UserNameWidget, UserModeWidget, UserSelectionWidget,
                        generate_user_camera, get_view_matrix, refresh_3d_view,
                        refresh_sidebar_view, presence_viewer)
@@ -148,62 +154,200 @@ class SessionListenTimer(Timer):
 
 
 class ApplyTimer(Timer):
+    _pending_assets_prev = False
+    _logged_post_asset_summary = False
+    _failed_apply_nodes: dict[str, tuple[int, float]] = {}
+    _deferred_nodes: dict[str, tuple[int, float]] = {}
+    _logged_construct_skips: set[str] = set()
+    _had_deferred_objects = False
+    _sync_hierarchy_done = False
+    _MAX_APPLY_RETRIES = 3
+    _MAX_HIERARCHY_RETRIES = 12
+
+    @classmethod
+    def _schedule_defer(cls, node_uuid: str, now: float, base_delay: float = 0.5) -> None:
+        attempts, _ = cls._deferred_nodes.get(node_uuid, (0, 0.0))
+        attempts += 1
+        delay = min(5.0, base_delay * attempts)
+        cls._deferred_nodes[node_uuid] = (attempts, now + delay)
+        cls._had_deferred_objects = True
+
+    @classmethod
+    def reset_sync_state(cls) -> None:
+        cls._pending_assets_prev = False
+        cls._logged_post_asset_summary = False
+        cls._failed_apply_nodes.clear()
+        cls._deferred_nodes.clear()
+        cls._logged_construct_skips.clear()
+        cls._had_deferred_objects = False
+        cls._sync_hierarchy_done = False
+
     def execute(self):
         if not session or session.state != STATE_ACTIVE:
+            ApplyTimer.reset_sync_state()
             return
 
         utils.update_textures_fetch_on_shading_change(bpy.context)
-        textures_enabled = utils.textures_fetch_enabled(bpy.context)
+        if not utils.textures_fetch_enabled(bpy.context):
+            utils.enable_textures_fetch(bpy.context)
 
         settings = utils.get_preferences()
         batch_size = settings.apply_batch_size if settings else 10
         applied = 0
+        pending_assets = utils.has_pending_fetched_assets(session.repository)
+
+        repaired_meshes = utils.repair_incomplete_meshes(session.repository)
+        if repaired_meshes:
+            utils.network_log(
+                logging.INFO,
+                "Re-queued %s mesh(es) missing geometry",
+                repaired_meshes,
+            )
+            for node_uuid in list(ApplyTimer._failed_apply_nodes.keys()):
+                node = session.repository.graph.get(node_uuid)
+                if (
+                    node
+                    and node.data
+                    and node.data.get('type_id') in utils.HIERARCHY_TYPE_IDS
+                ):
+                    ApplyTimer._failed_apply_nodes.pop(node_uuid, None)
 
         candidates = []
+        now = time.monotonic()
+        index_ranks = utils.build_index_sorted_ranks(session.repository)
+        material_assets_ready = not utils.has_pending_fetched_asset_type(
+            session.repository,
+            utils.LOAD_BEFORE_MATERIAL_TYPE_IDS,
+        )
         for node in session.repository.graph.keys():
             node_ref = session.repository.graph.get(node)
             if node_ref is None or node_ref.state != FETCHED:
                 continue
             type_id = node_ref.data.get('type_id') if node_ref.data else None
-            if utils.is_deferred_asset_type(type_id) and not textures_enabled:
+            if pending_assets and type_id not in utils.ASSET_TYPE_IDS:
                 continue
-            candidates.append((type_id in utils.ASSET_TYPE_IDS, node))
+            if type_id == 'Material' and not material_assets_ready:
+                continue
+            if type_id in utils.OBJECT_TYPE_IDS:
+                if not utils.is_object_apply_ready(node_ref, session.repository):
+                    defer_state = ApplyTimer._deferred_nodes.get(node_ref.uuid)
+                    if defer_state and now < defer_state[1]:
+                        continue
+                    ApplyTimer._schedule_defer(node_ref.uuid, now)
+                    continue
+            defer_state = ApplyTimer._deferred_nodes.get(node_ref.uuid)
+            if defer_state and now < defer_state[1]:
+                continue
+            retry_state = ApplyTimer._failed_apply_nodes.get(node_ref.uuid)
+            if retry_state:
+                failures, next_retry = retry_state
+                max_retries = (
+                    ApplyTimer._MAX_HIERARCHY_RETRIES
+                    if type_id in utils.HIERARCHY_TYPE_IDS
+                    else ApplyTimer._MAX_APPLY_RETRIES
+                )
+                if failures >= max_retries:
+                    continue
+                if now < next_retry:
+                    continue
+            candidates.append((
+                utils.asset_apply_sort_key(type_id, node, index_ranks),
+                node,
+                type_id,
+            ))
 
         candidates.sort(key=lambda item: item[0])
 
-        for _, node in candidates:
+        for _, node, type_id in candidates:
             if applied >= batch_size:
                 break
 
             node_ref = session.repository.graph.get(node)
             if node_ref is None or node_ref.instance is None:
                 if node_ref and node_ref.data:
-                    node_ref.instance = session.repository.rdp.resolve(node_ref.data)
-                    if node_ref.instance is None:
-                        node_ref.instance = session.repository.rdp.construct(node_ref.data)
-                    if node_ref.instance is not None:
-                        node_ref.instance.uuid = node_ref.uuid
+                    try:
+                        node_ref.instance = session.repository.rdp.resolve(node_ref.data)
+                        if node_ref.instance is None:
+                            node_ref.instance = session.repository.rdp.construct(node_ref.data)
+                        if node_ref.instance is not None and not is_replicated_file(node_ref.instance):
+                            node_ref.instance.uuid = node_ref.uuid
+                    except Exception:
+                        logging.error(f"Fail to construct {node_ref.uuid}")
+                        traceback.print_exc()
+                        utils.network_log(
+                            logging.ERROR,
+                            "Failed to construct node %s (type=%s)",
+                            node_ref.uuid,
+                            type_id,
+                        )
                 if node_ref is None or node_ref.instance is None:
+                    block_name = (
+                        node_ref.data.get('name', '?')
+                        if node_ref and node_ref.data else '?'
+                    )
+                    if node_ref and node_ref.uuid not in ApplyTimer._logged_construct_skips:
+                        ApplyTimer._logged_construct_skips.add(node_ref.uuid)
+                        utils.network_log(
+                            logging.WARNING,
+                            "Deferring apply: no instance for %s type=%s name=%s",
+                            getattr(node_ref, 'uuid', node),
+                            type_id,
+                            block_name,
+                        )
+                    if node_ref:
+                        ApplyTimer._schedule_defer(node_ref.uuid, now)
                     continue
+
+            block_name = node_ref.data.get('name', '?') if node_ref.data else '?'
+            utils.network_log(
+                logging.INFO,
+                "Applying %s %r (uuid=%s)",
+                type_id or 'unknown',
+                block_name,
+                node_ref.uuid,
+            )
 
             try:
                 shared_data.session.applied_updates.append(node)
                 porcelain.apply(session.repository, node)
             except Exception:
-                logging.error(f"Fail to apply {node_ref.uuid}")
-                traceback.print_exc()
+                failures, _ = ApplyTimer._failed_apply_nodes.get(node_ref.uuid, (0, 0.0))
+                failures += 1
+                retry_delay = min(30.0, 2.0 ** failures)
+                ApplyTimer._failed_apply_nodes[node_ref.uuid] = (
+                    failures,
+                    time.monotonic() + retry_delay,
+                )
+                max_retries = (
+                    ApplyTimer._MAX_HIERARCHY_RETRIES
+                    if type_id in utils.HIERARCHY_TYPE_IDS
+                    else ApplyTimer._MAX_APPLY_RETRIES
+                )
+                logging.exception("Fail to apply %s", node_ref.uuid)
                 utils.network_log(
                     logging.ERROR,
-                    "Failed to apply node %s",
+                    "Failed to apply %s type=%s name=%r (attempt %s/%s, retry in %.0fs)",
                     node_ref.uuid,
+                    type_id,
+                    block_name,
+                    failures,
+                    max_retries,
+                    retry_delay,
                 )
             else:
+                ApplyTimer._failed_apply_nodes.pop(node_ref.uuid, None)
+                ApplyTimer._deferred_nodes.pop(node_ref.uuid, None)
                 applied += 1
                 impl = session.repository.rdp.get_implementation(node_ref.instance)
                 if impl.bl_reload_parent:
                     for parent in session.repository.graph.get_parents(node):
                         logging.debug("Refresh parent {node}")
                         try:
+                            # Record the forced reload so the depsgraph handler
+                            # ignores this self-induced change instead of
+                            # committing/pushing it back (which echoes from the
+                            # server and re-fetches the node forever).
+                            shared_data.session.applied_updates.append(parent.uuid)
                             porcelain.apply(
                                 session.repository,
                                 parent.uuid,
@@ -214,7 +358,15 @@ class ApplyTimer(Timer):
                             traceback.print_exc()
                 if hasattr(impl, 'bl_reload_child') and impl.bl_reload_child:
                     for dep in node_ref.dependencies:
+                        dep_node = session.repository.graph.get(dep)
+                        if dep_node and dep_node.state == UP and dep_node.data:
+                            dep_type = dep_node.data.get('type_id')
+                            if dep_type in utils.FILE_ASSET_TYPE_IDS | {'Image'}:
+                                continue
                         try:
+                            # See note above: guard forced child reloads too so
+                            # they don't trigger a commit/push feedback loop.
+                            shared_data.session.applied_updates.append(dep)
                             porcelain.apply(session.repository,
                                             dep,
                                             force=True)
@@ -222,23 +374,118 @@ class ApplyTimer(Timer):
                             logging.error(f"Fail to refresh child {dep}")
                             traceback.print_exc()
 
+        pending_assets_after = utils.has_pending_fetched_assets(session.repository)
+
         if applied:
             remaining = sum(
                 1 for node in session.repository.graph.values()
                 if node.state == FETCHED
             )
             utils.network_log(
-                logging.DEBUG,
-                "Applied %s datablock(s), %s remaining",
+                logging.INFO,
+                "Applied %s datablock(s), %s FETCHED remaining, pending_assets=%s",
                 applied,
                 remaining,
+                pending_assets_after,
             )
 
+        if pending_assets and not pending_assets_after:
+            reloaded = reload_images_waiting_for_files(session.repository)
+            if reloaded:
+                utils.network_log(
+                    logging.INFO,
+                    "Reloaded %s image(s) after texture files synced",
+                    reloaded,
+                )
+            refreshed = refresh_mesh_material_slots(session.repository)
+            if refreshed:
+                utils.network_log(
+                    logging.INFO,
+                    "Refreshed material slots on %s mesh(es)",
+                    refreshed,
+                )
+            utils.log_replication_graph_summary(
+                session.repository,
+                label="post-asset-sync",
+            )
+            ApplyTimer._logged_post_asset_summary = True
+
+        if (
+            not pending_assets_after
+            and not ApplyTimer._logged_post_asset_summary
+            and applied
+        ):
+            utils.log_replication_graph_summary(
+                session.repository,
+                label="post-apply",
+            )
+
+        ApplyTimer._pending_assets_prev = pending_assets_after
+
         try:
-            maybe_finalize_node_trees(session.repository, textures_enabled=textures_enabled)
+            maybe_finalize_node_trees(session.repository)
         except Exception:
             logging.error("Failed to finalize node trees")
             traceback.print_exc()
+
+        if not pending_assets_after:
+            refreshed = refresh_mesh_material_slots(session.repository)
+            if refreshed:
+                utils.network_log(
+                    logging.INFO,
+                    "Refreshed material slots on %s mesh(es) after finalize",
+                    refreshed,
+                )
+            reloaded = reload_images_waiting_for_files(session.repository)
+            if reloaded:
+                utils.network_log(
+                    logging.INFO,
+                    "Reloaded %s image(s) after finalize",
+                    reloaded,
+                )
+
+        # Once assets are synced, keep linking collections/scenes so objects
+        # become visible even if a few datablocks are still FETCHED.
+        fetched_remaining = sum(
+            1 for node in session.repository.graph.values()
+            if node.state == FETCHED
+        )
+        if not pending_assets_after and not ApplyTimer._sync_hierarchy_done:
+            try:
+                utils.refresh_scene_hierarchy(session.repository)
+            except Exception:
+                logging.exception("Failed to refresh scene hierarchy")
+
+            has_linked_scene = any(
+                node.data
+                and node.data.get('type_id') == 'Scene'
+                and isinstance(node.instance, bpy.types.Scene)
+                and utils.count_scene_linked_objects(node.instance) > 0
+                for node in session.repository.graph.values()
+            )
+            if has_linked_scene:
+                ApplyTimer._sync_hierarchy_done = True
+
+        if not pending_assets_after:
+            runtime = getattr(bpy.context.window_manager, 'session', None)
+            is_host = bool(runtime and runtime.is_host)
+            if not is_host:
+                try:
+                    active = bpy.context.window.scene
+                    needs_switch = (
+                        not shared_data.session.client_scene_switched
+                        or (active is not None and utils.count_scene_linked_objects(active) == 0)
+                    )
+                    if needs_switch and utils.switch_client_to_host_scene(
+                        session.repository,
+                    ):
+                        shared_data.session.client_scene_switched = True
+                        utils.network_log(
+                            logging.INFO,
+                            "Switched client view to the synced host scene",
+                        )
+                except Exception:
+                    logging.exception("Failed to switch client to host scene")
 
 
 class AnnotationUpdates(Timer):
@@ -481,7 +728,9 @@ class SessionStatusUpdate(Timer):
             refresh_3d_view()
 
         pending_assets = textures_enabled and total > 0 and applied < total
-        pending = pending_assets
+        scene_applied, scene_total = utils.get_scene_apply_progress()
+        pending_scene = scene_total > 0 and scene_applied < scene_total
+        pending = pending_assets or pending_scene
         if pending and not SessionStatusUpdate._fast_refresh:
             SessionStatusUpdate._fast_refresh = True
             self._timeout = 0.25

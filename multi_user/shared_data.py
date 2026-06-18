@@ -30,6 +30,11 @@ class SessionData():
         self.remote = None  # The active remote
         self.server = None
         self.applied_updates = []
+        # Name of the leftover local scene a client keeps after clean_scene().
+        # Used to avoid pushing it as a duplicate node and to switch the view
+        # to the host's populated scene once the initial sync completes.
+        self.bootstrap_scene_name = None
+        self.client_scene_switched = False
 
     @property
     def state(self):
@@ -43,6 +48,8 @@ class SessionData():
         self.repository = None
         self.server = None
         self.applied_updates = []
+        self.bootstrap_scene_name = None
+        self.client_scene_switched = False
 
 
 session = SessionData()

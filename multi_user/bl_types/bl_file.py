@@ -31,10 +31,13 @@ def get_filepath(filename):
     """
     Construct the local filepath
     """
-    return str(Path(
-        utils.get_preferences().cache_directory,
-        filename
-    ))
+    cache_dir = Path(utils.get_preferences().cache_directory)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return str(cache_dir / filename)
+
+
+def is_replicated_file(datablock: object) -> bool:
+    return isinstance(datablock, (WindowsPath, PosixPath))
 
 
 def ensure_unpacked(datablock):
@@ -75,21 +78,22 @@ class BlFile(ReplicatedDatablock):
         """
         logging.info("Extracting file metadata")
 
-        data = {
-            'name': datablock.name,
-        }
-
-        logging.info(f"Reading {datablock.name} content: {datablock.stat().st_size} bytes")
+        data = {'name': datablock.name}
 
         try:
-            file = open(datablock, "rb")
-            data['file'] = file.read()
+            disk_size = datablock.stat().st_size
+        except OSError:
+            logging.warning("%s doesn't exist, skipping", datablock)
+            return data
 
-            file.close()
+        try:
+            with open(datablock, "rb") as file:
+                data['file'] = file.read()
         except IOError:
-            logging.warning(f"{datablock} doesn't exist, skipping")
-        else:
-            file.close()
+            logging.warning("%s doesn't exist, skipping", datablock)
+            return data
+
+        logging.info("Reading %s content: %s bytes", datablock.name, disk_size)
 
         return data
 
@@ -99,16 +103,25 @@ class BlFile(ReplicatedDatablock):
         Writing the file
         """
 
-        try:
-            file = open(datablock, "wb")
-            file.write(data['file'])
+        payload = data.get('file')
+        if payload is None:
+            logging.warning("No file payload for %s, skipping", data.get('name', datablock))
+            return
 
+        try:
+            datablock.parent.mkdir(parents=True, exist_ok=True)
+            with open(datablock, "wb") as file:
+                file.write(payload)
             if get_preferences().clear_memory_filecache:
                 del data["file"]
         except IOError:
             logging.warning(f"{datablock} doesn't exist, skipping")
         else:
-            file.close()
+            logging.info(
+                "Cached texture file %s (%s bytes)",
+                datablock.name,
+                len(payload),
+            )
 
     @staticmethod
     def resolve_deps(datablock: object) -> list[object]:
@@ -125,7 +138,11 @@ class BlFile(ReplicatedDatablock):
             if not data:
                 return True
 
-            memory_size = sys.getsizeof(data['file'])-33
+            payload = data.get('file')
+            if payload is None:
+                return False
+
+            memory_size = sys.getsizeof(payload)-33
             disk_size = datablock.stat().st_size
 
             if memory_size != disk_size:

@@ -22,9 +22,14 @@ import re
 
 from .dump_anything import Loader, Dumper
 from replication.constants import FETCHED
+from replication import porcelain
 from replication.protocol import ReplicatedDatablock
 
-from .bl_datablock import get_datablock_from_uuid, resolve_datablock_from_uuid
+from .bl_datablock import (
+    get_datablock_from_uuid,
+    preserve_replicated_datablock,
+    resolve_datablock_from_uuid,
+)
 from ..utils import ASSET_TYPE_IDS
 from .bl_action import (
     dump_animation_data,
@@ -40,7 +45,7 @@ from bpy.types import (
     NodeSocketMaterial,
 )
 
-NODE_SOCKET_INDEX = re.compile("\[(\d*)\]")
+NODE_SOCKET_INDEX = re.compile(r"\[(\d*)\]")
 IGNORED_SOCKETS = [
     "NodeSocketGeometry",
     "NodeSocketShader",
@@ -71,7 +76,16 @@ def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
         :type node_tree: bpy.types.NodeTree
     """
     loader = Loader()
-    target_node = node_tree.nodes.new(type=node_data["bl_idname"])
+    try:
+        target_node = node_tree.nodes.new(type=node_data["bl_idname"])
+    except Exception as exc:
+        logging.warning(
+            "Skipping unsupported material node %s (%s): %s",
+            node_data.get("name", "?"),
+            node_data.get("bl_idname", "?"),
+            exc,
+        )
+        return None
     target_node.select = False
     loader.load(target_node, node_data)
     image_uuid = node_data.get('image_uuid', None)
@@ -80,7 +94,7 @@ def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
     if image_uuid and not target_node.image:
         image = resolve_datablock_from_uuid(image_uuid, bpy.data.images)
         if image is None:
-            logging.error(f"Fail to find material image from uuid {image_uuid}")
+            logging.warning("Material image not ready yet: %s", image_uuid)
         else:
             target_node.image = image
 
@@ -92,15 +106,21 @@ def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
         for sock_name, sock_type in node_data['repeat_items'].items():
             target_node.repeat_items.new(sock_type, sock_name)
 
+    return target_node
+
 
 def load_node_io(nodes_data: dict, node_tree: bpy.types.ShaderNodeTree):
     for target_node in node_tree.nodes:
         node_data = nodes_data[target_node.name]
         inputs_data = node_data.get('inputs')
         if inputs_data:
-            inputs = [i for i in target_node.inputs if not isinstance(i, IGNORED_SOCKETS_TYPES)]
+            inputs = [
+                i for i in target_node.inputs
+                if not isinstance(i, IGNORED_SOCKETS_TYPES)
+                and hasattr(i, "default_value")
+            ]
             for idx, inpt in enumerate(inputs):
-                if idx < len(inputs_data) and hasattr(inpt, "default_value"):
+                if idx < len(inputs_data):
                     loaded_input = inputs_data[idx]
                     try:
                         if isinstance(inpt, ID_NODE_SOCKETS):
@@ -115,9 +135,13 @@ def load_node_io(nodes_data: dict, node_tree: bpy.types.ShaderNodeTree):
 
         outputs_data = node_data.get('outputs')
         if outputs_data:
-            outputs = [o for o in target_node.outputs if not isinstance(o, IGNORED_SOCKETS_TYPES)]
+            outputs = [
+                o for o in target_node.outputs
+                if not isinstance(o, IGNORED_SOCKETS_TYPES)
+                and hasattr(o, "default_value")
+            ]
             for idx, output in enumerate(outputs):
-                if idx < len(outputs_data) and hasattr(output, "default_value"):
+                if idx < len(outputs_data):
                     loaded_output = outputs_data[idx]
                     try:
                         if isinstance(output, ID_NODE_SOCKETS):
@@ -363,11 +387,9 @@ def load_node_tree_sockets(interface: bpy.types.NodeTreeInterface,
         :arg socket_data: dumped socket data
         :type socket_data: dict
     """
-    # Remove old sockets
     interface.clear()
     socket_loader = Loader()
 
-    # Check for new sockets
     for socket_data in sockets_data:
         if socket_data['item_type'] == 'SOCKET':
             socket = interface.new_socket(
@@ -382,19 +404,6 @@ def load_node_tree_sockets(interface: bpy.types.NodeTreeInterface,
                 default_closed=socket_data['default_closed']
             )
         socket_loader.load(socket, socket_data)
-    
-    # for socket_data in sockets_data:
-    #     if 'parent' in socket_data:
-    #         socket_parent_index = socket_data['parent']
-    #         socket_parent = interface.items_tree[socket_parent_index]
-    #         if type(socket_parent) != bpy.types.NodeTreeInterfacePanel:
-    #             continue
-            # interface.move_to_parent(socket, socket_parent)
-
-    # Load parents
-    # sockets = [item for item in interface.items_tree if item.item_type == 'SOCKET']
-    # for socket in sockets:
-
 
 def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeTree) -> dict:
     """Load a shader node_tree from dumped data
@@ -431,6 +440,8 @@ def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeT
     for node_input_data in zone_input_to_pair:
         zone_input = target_node_tree.nodes.get(node_input_data['name'])
         zone_output = target_node_tree.nodes.get(node_input_data['paired_output'])
+        if zone_input is None or zone_output is None:
+            continue
 
         zone_input.pair_with_output(zone_output)
 
@@ -503,7 +514,7 @@ def get_material_node_tree_finalize_progress() -> tuple[int, int]:
     return (_node_tree_finalize_total - remaining, _node_tree_finalize_total)
 
 
-def maybe_finalize_node_trees(repository, textures_enabled: bool = False) -> None:
+def maybe_finalize_node_trees(repository) -> None:
     """Finalize node trees once their datablocks have been applied."""
     global _node_trees_finalized, _geometry_node_trees_finalized
     global _node_tree_finalize_queue, _geometry_node_tree_finalize_queue
@@ -512,7 +523,7 @@ def maybe_finalize_node_trees(repository, textures_enabled: bool = False) -> Non
     if not _geometry_node_trees_finalized:
         pending_groups = any(
             node.state == FETCHED and node.data and
-            node.data.get('type_id') == 'node_groups'
+            node.data.get('type_id') == 'GeometryNodeTree'
             for node in repository.graph.values()
         )
         if not pending_groups:
@@ -521,7 +532,7 @@ def maybe_finalize_node_trees(repository, textures_enabled: bool = False) -> Non
                     node_ref = repository.graph.get(node_id)
                     if node_ref is None or not node_ref.data:
                         continue
-                    if node_ref.data.get('type_id') == 'node_groups':
+                    if node_ref.data.get('type_id') == 'GeometryNodeTree':
                         _geometry_node_tree_finalize_queue.append(
                             (node_ref.data, node_ref.instance)
                         )
@@ -531,7 +542,7 @@ def maybe_finalize_node_trees(repository, textures_enabled: bool = False) -> Non
             if not _geometry_node_tree_finalize_queue:
                 _geometry_node_trees_finalized = True
 
-    if not textures_enabled or _node_trees_finalized:
+    if _node_trees_finalized:
         return
 
     for node in repository.graph.values():
@@ -545,7 +556,7 @@ def maybe_finalize_node_trees(repository, textures_enabled: bool = False) -> Non
             if node_ref is None or not node_ref.data:
                 continue
             type_id = node_ref.data.get('type_id')
-            if type_id == 'materials' and node_ref.data.get('use_nodes'):
+            if type_id == 'Material' and node_ref.data.get('use_nodes'):
                 if node_ref.instance and node_ref.instance.node_tree:
                     _node_tree_finalize_queue.append(
                         (node_ref.data['node_tree'], node_ref.instance.node_tree)
@@ -606,8 +617,73 @@ def load_materials_slots(src_materials: list, dst_materials: bpy.types.bpy_prop_
         if mat_uuid:
             mat_ref = get_datablock_from_uuid(mat_uuid, None)
         else:
-            mat_ref = bpy.data.materials[mat_name]
+            mat_ref = bpy.data.materials.get(mat_name)
+        if mat_ref is None:
+            logging.warning(
+                "Material slot unresolved: uuid=%s name=%s",
+                mat_uuid,
+                mat_name,
+            )
         dst_materials.append(mat_ref)
+
+
+def refresh_mesh_material_slots(repository) -> int:
+    """Re-bind mesh material slots after materials/images have synced."""
+    from replication.constants import UP
+
+    refreshed = 0
+    for node in repository.graph.values():
+        if node.state != UP or not node.instance or not node.data:
+            continue
+        if node.data.get('type_id') != 'meshes':
+            continue
+        materials = node.data.get('materials')
+        if not materials:
+            continue
+
+        mesh = node.instance
+        before = [slot.name if slot else None for slot in mesh.materials]
+        load_materials_slots(materials, mesh.materials)
+        after = [slot.name if slot else None for slot in mesh.materials]
+
+        if before != after:
+            refreshed += 1
+            logging.info(
+                "Mesh %s material slots updated: %s -> %s",
+                mesh.name,
+                before,
+                after,
+            )
+    return refreshed
+
+
+def register_scene_material_assets(repository) -> dict[str, int]:
+    """Register mesh/world materials (and their image files) on the host repository."""
+    stats = {'materials': 0, 'skipped': 0}
+    seen_materials: set[int] = set()
+
+    def register_material(material) -> None:
+        if material is None:
+            return
+        material_id = id(material)
+        if material_id in seen_materials:
+            return
+        seen_materials.add(material_id)
+        if repository.get_node_by_datablock(material):
+            stats['skipped'] += 1
+            return
+        try:
+            porcelain.add(repository, material, skip_unsupported=True)
+            stats['materials'] += 1
+            logging.info("Registered material for sync: %s", material.name)
+        except Exception as exc:
+            logging.warning("Failed to register material %s: %s", material.name, exc)
+
+    for mesh in bpy.data.meshes:
+        for material in mesh.materials:
+            register_material(material)
+
+    return stats
 
 
 class BlMaterial(ReplicatedDatablock):
@@ -622,28 +698,50 @@ class BlMaterial(ReplicatedDatablock):
 
     @staticmethod
     def construct(data: dict) -> object:
-        return bpy.data.materials.new(data["name"])
+        material = bpy.data.materials.new(data["name"])
+        preserve_replicated_datablock(material)
+        return material
+
+    _LOAD_SKIP_KEYS = frozenset({
+        'node_tree',
+        'grease_pencil',
+        'animation_data',
+        'nodes_animation_data',
+        'type_id',
+        'uuid',
+    })
 
     @staticmethod
     def load(data: dict, datablock: object):
         loader = Loader()
+        safe_data = {
+            key: value for key, value in data.items()
+            if key not in BlMaterial._LOAD_SKIP_KEYS
+        }
+        loader.load(datablock, safe_data)
 
         is_grease_pencil = data.get('is_grease_pencil')
         use_nodes = data.get('use_nodes')
-
-        loader.load(datablock, data)
 
         if is_grease_pencil:
             if not datablock.is_grease_pencil:
                 bpy.data.materials.create_gpencil_data(datablock)
             loader.load(datablock.grease_pencil, data['grease_pencil'])
-        elif use_nodes:
+        elif use_nodes and data.get('node_tree'):
             if datablock.node_tree is None:
                 datablock.use_nodes = True
 
             load_node_tree(data['node_tree'], datablock.node_tree)
             load_animation_data(data.get('nodes_animation_data'), datablock.node_tree)
         load_animation_data(data.get('animation_data'), datablock)
+        preserve_replicated_datablock(datablock)
+        logging.info(
+            "Material %s loaded (use_nodes=%s, users=%s, fake_user=%s)",
+            datablock.name,
+            datablock.use_nodes,
+            datablock.users,
+            datablock.use_fake_user,
+        )
 
     @staticmethod
     def dump(datablock: object) -> dict:

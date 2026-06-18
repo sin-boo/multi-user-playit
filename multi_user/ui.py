@@ -20,7 +20,7 @@ import bpy
 import bpy.utils.previews
 
 from .utils import (get_version, get_preferences, get_expanded_icon, get_folder_size,
-                    get_state_str, get_asset_sync_progress,
+                    get_state_str, get_asset_sync_progress, get_scene_apply_progress,
                     printProgressBar)
 from replication.constants import (
     ADDED,
@@ -240,17 +240,27 @@ class SESSION_PT_settings(bpy.types.Panel):
                         ))
 
                     if current_state == STATE_ACTIVE:
-                        runtime = context.window_manager.session
-                        if runtime.textures_fetch_enabled:
-                            applied, total = get_asset_sync_progress()
-                            if total > 0 and applied < total:
+                        applied, total = get_asset_sync_progress()
+                        if total > 0 and applied < total:
+                            row = layout.row()
+                            row.label(text="Fetching materials")
+                            row = layout.row()
+                            mat_box = row.box()
+                            mat_box.label(text=printProgressBar(
+                                applied,
+                                total,
+                                length=16,
+                            ))
+                        else:
+                            scene_applied, scene_total = get_scene_apply_progress()
+                            if scene_total > 0 and scene_applied < scene_total:
                                 row = layout.row()
-                                row.label(text="Fetching materials")
+                                row.label(text="Applying scene")
                                 row = layout.row()
-                                mat_box = row.box()
-                                mat_box.label(text=printProgressBar(
-                                    applied,
-                                    total,
+                                scene_box = row.box()
+                                scene_box.label(text=printProgressBar(
+                                    scene_applied,
+                                    scene_total,
                                     length=16,
                                 ))
 

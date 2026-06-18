@@ -40,8 +40,9 @@ from replication.exception import NonAuthorizedOperationError
 from replication.interface import session
 from replication.repository import Repository
 
-from . import bl_types, timers, utils
-from .bl_types.bl_material import reset_node_tree_finalize_state
+from . import bl_types, shared_data, timers, utils
+from .bl_types.bl_file import is_replicated_file
+from .bl_types.bl_material import reset_node_tree_finalize_state, register_scene_material_assets
 from .handlers import on_scene_update
 from .presence import (SessionStatusWidget, MaterialsFetchWidget, bbox_from_obj,
                        refresh_sidebar_view, presence_viewer, view3d_find)
@@ -171,7 +172,13 @@ def initialize_session():
 
     if not runtime_settings.is_host:
         logging.info("Intializing the scene")
-        # Construct/apply deferred to ApplyTimer (geometry first, textures on demand)
+        reset_node_tree_finalize_state()
+        utils.ensure_client_asset_sync()
+        if session and getattr(session, 'repository', None):
+            utils.log_replication_graph_summary(
+                session.repository,
+                label="post-connect",
+            )
 
     logging.info("Registering timers")
     # Step 4: Register blender timers
@@ -195,6 +202,9 @@ def on_connection_end(reason="none"):
     utils.clear_connected_session_info()
     utils.reset_textures_fetch_state()
     reset_node_tree_finalize_state()
+    timers.ApplyTimer.reset_sync_state()
+    shared_data.session.bootstrap_scene_name = None
+    shared_data.session.client_scene_switched = False
     if "server not found" in reason.lower():
         utils.network_log(
             logging.ERROR,
@@ -354,8 +364,22 @@ class SessionJoinOperator(bpy.types.Operator):
             username=settings.username)
 
         # Join a session
-        if not active_server.use_admin_password:
-            utils.clean_scene()
+        # Always start a client from a clean local scene so the server
+        # snapshot is the single source of truth. Keeping local datablocks
+        # (e.g. the default cube scene/world) makes them get auto-added to the
+        # replication graph by the depsgraph handler, producing duplicate
+        # "Scene"/"World" nodes that clobber the freshly synced geometry.
+        utils.clean_scene()
+
+        # Remember the leftover local scene. clean_scene() cannot delete the
+        # last scene, so this empty "bootstrap" scene survives. We track it to
+        # avoid pushing it as a duplicate node and to swap the client's view to
+        # the host's populated scene once the snapshot finishes applying.
+        shared_data.session.client_scene_switched = False
+        try:
+            shared_data.session.bootstrap_scene_name = context.window.scene.name
+        except Exception:
+            shared_data.session.bootstrap_scene_name = None
 
         try:
             utils.set_connected_session_info(
@@ -454,6 +478,14 @@ class SessionHostOperator(bpy.types.Operator):
             for scene in bpy.data.scenes:
                 porcelain.add(repo, scene)
 
+            material_stats = register_scene_material_assets(repo)
+            utils.network_log(
+                logging.INFO,
+                "Host registered %s material(s) for replication (%s already tracked)",
+                material_stats['materials'],
+                material_stats['skipped'],
+            )
+
             porcelain.remote_add(
                 repo,
                 'origin',
@@ -523,6 +555,14 @@ class SessionInitOperator(bpy.types.Operator):
 
         for scene in bpy.data.scenes:
             porcelain.add(session.repository, scene)
+
+        material_stats = register_scene_material_assets(session.repository)
+        utils.network_log(
+            logging.INFO,
+            "Session init registered %s material(s) (%s already tracked)",
+            material_stats['materials'],
+            material_stats['skipped'],
+        )
 
         session.init()
         context.window_manager.session.is_host = True
@@ -1038,7 +1078,8 @@ class SessionLoadSaveOperator(bpy.types.Operator, ImportHelper):
             node.instance = bpy_protocol.resolve(node.data)
             if node.instance is None:
                 node.instance = bpy_protocol.construct(node.data)
-                node.instance.uuid = node.uuid
+                if not is_replicated_file(node.instance):
+                    node.instance.uuid = node.uuid
 
         # Step 2: Load nodes
         for node in nodes:

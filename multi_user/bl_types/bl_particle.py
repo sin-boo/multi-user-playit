@@ -11,7 +11,8 @@ IGNORED_ATTR = [
     "is_evaluated",
     "is_fluid",
     "is_library_indirect",
-    "users"
+    "users",
+    "texture_slots",
 ]
 
 
@@ -56,7 +57,14 @@ class BlParticle(ReplicatedDatablock):
     @staticmethod
     def load(data: dict, datablock: object):
         load_animation_data(data.get('animation_data'), datablock)
-        dump_anything.load(datablock, data)
+        loader = dump_anything.Loader()
+        loader.exclure_filter = [
+            'texture_slots',
+            'effector_weights',
+            'force_field_1',
+            'force_field_2',
+        ]
+        loader.load(datablock, data)
 
         dump_anything.load(datablock.effector_weights, data["effector_weights"])
 
@@ -69,8 +77,10 @@ class BlParticle(ReplicatedDatablock):
         if force_field_2:
             dump_anything.load(datablock.force_field_2, force_field_2)
 
-        # Texture slots
-        load_texture_slots(data["texture_slots"], datablock.texture_slots)
+        # Texture slots (custom list format, not a generic collection dict)
+        texture_slots = data.get("texture_slots")
+        if texture_slots is not None:
+            load_texture_slots(texture_slots, datablock.texture_slots)
 
     @staticmethod
     def dump(datablock: object) -> dict:

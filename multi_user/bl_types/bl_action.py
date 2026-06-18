@@ -17,6 +17,7 @@
 
 
 import copy
+import logging
 
 import bpy
 from bpy_extras import anim_utils
@@ -67,6 +68,7 @@ def dump_driver(driver):
 
 def load_driver(target_datablock, src_driver):
     loader = Loader()
+    loader.exclure_filter = ['driver']
     drivers = target_datablock.animation_data.drivers
     src_driver_data = src_driver['driver']
     new_driver = drivers.new(src_driver['data_path'], index=src_driver['array_index'])
@@ -85,10 +87,26 @@ def load_driver(target_datablock, src_driver):
 
         for src_target in src_var_data['targets']:
             src_target_data = src_var_data['targets'][src_target]
+            new_target = new_var.targets[src_target]
+            src_id_type = src_target_data.get('id_type')
+            if src_id_type:
+                new_target.id_type = src_id_type
+
             src_id = src_target_data.get('id')
             if src_id:
-                new_var.targets[src_target].id = utils.resolve_from_id(src_target_data['id'], src_target_data['id_type'])
-            loader.load(new_var.targets[src_target],  src_target_data)
+                resolved_id = utils.resolve_from_id(src_id, src_id_type)
+                try:
+                    new_target.id = resolved_id
+                except TypeError as err:
+                    logging.warning(
+                        "Skipping incompatible driver target id %r (%s): %s",
+                        src_id,
+                        src_id_type,
+                        err,
+                    )
+            target_loader = Loader()
+            target_loader.exclure_filter = ['id', 'id_type']
+            target_loader.load(new_target,  src_target_data)
 
     # Fcurve
     new_fcurve = new_driver.keyframe_points

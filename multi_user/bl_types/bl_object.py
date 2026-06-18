@@ -524,12 +524,35 @@ class BlObject(ReplicatedDatablock):
             ignore=['images'])  # TODO: use resolve_from_id
 
         if data_type != 'EMPTY' and object_data is None:
-            raise Exception(f"Fail to load object {data['name']})")
+            logging.warning(
+                "Deferring object %s: data %s (uuid=%s) not ready yet",
+                object_name,
+                data_id,
+                data_uuid,
+            )
+            return None
+
+        if (
+            data_type == 'MESH'
+            and object_data is not None
+            and len(object_data.vertices) == 0
+        ):
+            logging.warning(
+                "Deferring object %s: mesh %s geometry not loaded yet",
+                object_name,
+                data_id,
+            )
+            return None
 
         return bpy.data.objects.new(object_name, object_data)
 
     @staticmethod
     def load(data: dict, datablock: object):
+        if datablock is None:
+            raise ReferenceError(
+                f"Object {data.get('name', '?')!r} not constructed yet"
+            )
+
         loader = Loader()
         load_animation_data(data.get('animation_data'), datablock)
         data_uuid = data.get("data_uuid")
@@ -551,20 +574,39 @@ class BlObject(ReplicatedDatablock):
         if shape_keys:
             load_shape_keys(shape_keys, datablock)
 
-        # Load transformation data
+        # Load transformation data (parenting applied separately below)
+        loader.exclure_filter = [
+            'parent',
+            'parent_type',
+            'parent_bone',
+            'parent_uid',
+        ]
         loader.load(datablock, data)
 
         #  Object display fields
         if 'display' in data:
             loader.load(datablock.display, data['display'])
 
-        #  Parenting
+        #  Parenting — parent must exist before parent_type BONE is valid
         parent_id = data.get('parent_uid')
+        parent_type = data.get('parent_type', 'OBJECT')
+        parent_bone = data.get('parent_bone', '')
+
+        parent = None
         if parent_id:
-            parent = get_datablock_from_uuid(parent_id[0], bpy.data.objects[parent_id[1]])
-            # Avoid reloading
-            if datablock.parent != parent and parent is not None:
-                datablock.parent = parent
+            parent = get_datablock_from_uuid(
+                parent_id[0],
+                bpy.data.objects.get(parent_id[1]),
+            )
+
+        if parent is not None:
+            datablock.parent = parent
+            if parent_type == 'BONE' and parent.type == 'ARMATURE':
+                datablock.parent_type = 'BONE'
+                if parent_bone and parent_bone in parent.data.bones:
+                    datablock.parent_bone = parent_bone
+            else:
+                datablock.parent_type = parent_type
         elif datablock.parent:
             datablock.parent = None
 

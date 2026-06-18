@@ -672,12 +672,12 @@ class SessionProps(bpy.types.PropertyGroup):
     )  # type:ignore
     presence_show_material_fetch_status: bpy.props.BoolProperty(
         name="Show material fetch progress",
-        description="Show material fetch progress in the viewport when using Material or Rendered shading",
+        description="Show material fetch progress in the viewport while images and materials sync",
         default=True,
     )  # type:ignore
     textures_fetch_enabled: bpy.props.BoolProperty(
         name="Textures fetch enabled",
-        description="Set when the user switches to Material or Rendered viewport shading",
+        description="Set when material and image sync is active for this session",
         default=False,
         options={'HIDDEN'},
     )  # type:ignore

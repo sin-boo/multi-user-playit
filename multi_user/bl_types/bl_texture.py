@@ -34,10 +34,22 @@ class BlTexture(ReplicatedDatablock):
     bl_icon = 'TEXTURE'
     bl_reload_parent = False
 
+    _LOAD_SKIP_KEYS = frozenset({
+        'node_tree',
+        'animation_data',
+        'type_id',
+        'uuid',
+    })
+
     @staticmethod
     def load(data: dict, datablock: object):
         loader = Loader()
-        loader.load(datablock, data)
+        loader.exclure_filter = list(BlTexture._LOAD_SKIP_KEYS)
+        safe_data = {
+            key: value for key, value in data.items()
+            if key not in BlTexture._LOAD_SKIP_KEYS
+        }
+        loader.load(datablock, safe_data)
         load_animation_data(data.get('animation_data'), datablock)
 
     @staticmethod
@@ -58,6 +70,7 @@ class BlTexture(ReplicatedDatablock):
             'is_evaluated',
             'name_full',
             'session_uid',
+            'node_tree',
         ]
 
         data = dumper.dump(datablock)

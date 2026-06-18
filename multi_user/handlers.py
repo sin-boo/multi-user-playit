@@ -50,8 +50,11 @@ def sanitize_deps_graph(remove_nodes: bool = False):
 
 
 def update_external_dependencies():
-    """Force external dependencies(files such as images) evaluation 
-    """
+    """Force external dependencies (files such as images) evaluation on the host."""
+    runtime = getattr(bpy.context.window_manager, 'session', None)
+    if runtime and not getattr(runtime, 'is_host', False):
+        return
+
     external_types = ['WindowsPath', 'PosixPath', 'Image']
     nodes_ids = [n.uuid for n in session.repository.graph.values() if n.data['type_id'] in external_types]
     for node_id in nodes_ids:
@@ -100,6 +103,14 @@ def on_scene_update(scene):
                 else:
                     continue
             elif isinstance(update.id, bpy.types.Scene):
+                # Don't push the leftover local bootstrap scene of a client that
+                # is still syncing: it is empty and would create a duplicate
+                # "Scene" node that hides the host's freshly synced geometry.
+                if (
+                    shared_data.session.bootstrap_scene_name == update.id.name
+                    and not shared_data.session.client_scene_switched
+                ):
+                    continue
                 scene = bpy.data.scenes.get(update.id.name)
                 scn_uuid = porcelain.add(session.repository, scene)
                 porcelain.commit(session.repository, scn_uuid)
@@ -113,7 +124,12 @@ def on_scene_update(scene):
         if scene_graph_changed:
             porcelain.purge_orphan_nodes(session.repository)
 
-        update_external_dependencies()
+        # While the initial snapshot is still being applied, most image/path
+        # nodes are in the FETCHED state. Trying to commit/push them on every
+        # depsgraph tick just spams "Commit skipped: data in a wrong state" and
+        # pegs the CPU, so defer this until the sync has settled.
+        if not utils.has_pending_fetched_assets(session.repository):
+            update_external_dependencies()
 
 
 @persistent

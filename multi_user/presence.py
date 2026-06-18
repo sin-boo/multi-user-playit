@@ -30,7 +30,7 @@ from replication.constants import STATE_ACTIVE, STATE_INITIAL
 from replication.interface import session
 
 from .utils import (find_from_attr, get_asset_sync_progress, get_preferences,
-                    get_state_str, is_texture_shading_active, printProgressBar,
+                    get_state_str, printProgressBar,
                     textures_fetch_enabled)
 
 # Helper functions
@@ -546,8 +546,6 @@ class MaterialsFetchWidget(Widget):
             return False
         if not textures_fetch_enabled(bpy.context):
             return False
-        if not is_texture_shading_active(bpy.context):
-            return False
         applied, total = get_asset_sync_progress()
         return total > 0 and applied < total
 
@@ -566,17 +564,18 @@ class MaterialsFetchWidget(Widget):
         applied, total = get_asset_sync_progress()
         progress = printProgressBar(applied, total, length=20)
 
-        blf.enable(0)
-        blf.position(0, hpos, vpos + line_height * 2, 0)
-        blf.size(0, font_size)
-        blf.color(0, color[0], color[1], color[2], color[3])
-        blf.draw(0, "Fetching materials")
+        font_id = 0
+        blf.enable(font_id, blf.SHADOW)
+        blf.position(font_id, hpos, vpos + line_height * 2, 0)
+        blf.size(font_id, font_size)
+        blf.color(font_id, color[0], color[1], color[2], color[3])
+        blf.draw(font_id, "Fetching materials")
 
-        blf.position(0, hpos, vpos + line_height, 0)
-        blf.size(0, font_size)
-        blf.color(0, color[0], color[1], color[2], color[3])
-        blf.draw(0, progress)
-        blf.disable(0)
+        blf.position(font_id, hpos, vpos + line_height, 0)
+        blf.size(font_id, font_size)
+        blf.color(font_id, color[0], color[1], color[2], color[3])
+        blf.draw(font_id, progress)
+        blf.disable(font_id, blf.SHADOW)
 
 
 class DrawFactory(object):

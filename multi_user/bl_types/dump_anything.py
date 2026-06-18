@@ -590,6 +590,13 @@ class Loader:
     def _load_collection(self, element, dump):
         if not element.bl_rna_property:
             return
+        if not isinstance(dump, dict):
+            logging.debug(
+                "Skipping collection %s: expected dict, got %s",
+                element.sub_element_name,
+                type(dump).__name__,
+            )
+            return
         # local enum
         CONSTRUCTOR_NEW = "new"
         CONSTRUCTOR_ADD = "add"
@@ -674,30 +681,40 @@ class Loader:
                     dst_curve.points.new(pos[0], pos[1])
         curves.update()
 
+    @staticmethod
+    def _safe_id_collection_get(collection, name):
+        if not name or not isinstance(name, str):
+            return None
+        try:
+            return collection.get(name)
+        except Exception as err:
+            logging.debug("Could not resolve pointer %r: %s", name, err)
+            return None
+
     def _load_pointer(self, instance, dump):
         rna_property_type = instance.bl_rna_property.fixed_type
         if not rna_property_type:
             return
         if isinstance(rna_property_type, T.Image):
-            instance.write(bpy.data.images.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.images, dump))
         elif isinstance(rna_property_type, T.Texture):
-            instance.write(bpy.data.textures.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.textures, dump))
         elif isinstance(rna_property_type, T.ColorRamp):
             self._load_default(instance, dump)
         elif isinstance(rna_property_type, T.NodeTree):
-            instance.write(bpy.data.node_groups.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.node_groups, dump))
         elif isinstance(rna_property_type, T.Object):
-            instance.write(bpy.data.objects.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.objects, dump))
         elif isinstance(rna_property_type, T.Mesh):
-            instance.write(bpy.data.meshes.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.meshes, dump))
         elif isinstance(rna_property_type, T.Material):
-            instance.write(bpy.data.materials.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.materials, dump))
         elif isinstance(rna_property_type, T.Collection):
-            instance.write(bpy.data.collections.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.collections, dump))
         elif isinstance(rna_property_type, T.VectorFont):
-            instance.write(bpy.data.fonts.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.fonts, dump))
         elif isinstance(rna_property_type, T.Sound):
-            instance.write(bpy.data.sounds.get(dump))
+            instance.write(self._safe_id_collection_get(bpy.data.sounds, dump))
         # elif isinstance(rna_property_type, T.ParticleSettings):
         #     instance.write(bpy.data.particles.get(dump))
 
@@ -726,9 +743,14 @@ class Loader:
     def _load_default(self, default, dump):
         if not _is_dictionnary(dump):
             return  # TODO error handling
+        target = default.read()
         for k in self._ordered_keys(dump.keys()):
+            if k in self.exclure_filter:
+                continue
+            if k == 'node_tree' and isinstance(target, T.Texture):
+                continue
             v = dump[k]
-            if not hasattr(default.read(), k):
+            if not hasattr(target, k):
                 continue
             try:
                 self._load_any(default.extend(k), v)

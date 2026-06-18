@@ -326,8 +326,59 @@ def find_from_attr(attr_name, attr_value, list):
     return None
 
 
-ASSET_TYPE_IDS = frozenset({'file', 'images', 'materials'})
-FINALIZE_BLOCKING_TYPE_IDS = frozenset({'file', 'images', 'materials', 'node_groups'})
+FILE_ASSET_TYPE_IDS = frozenset({'WindowsPath', 'PosixPath'})
+LOAD_BEFORE_MATERIAL_TYPE_IDS = FILE_ASSET_TYPE_IDS | {'Image'}
+ASSET_TYPE_IDS = frozenset({'Material', 'Image'}) | FILE_ASSET_TYPE_IDS
+ASSET_APPLY_ORDER = {
+    'WindowsPath': 0,
+    'PosixPath': 0,
+    'Image': 1,
+    'Material': 2,
+}
+# Apply tiers for non-asset datablocks (lower = earlier).
+APPLY_TYPE_TIER = {
+    'Material': 1,
+    'ShaderNodeTree': 1,
+    'GeometryNodeTree': 1,
+    'Mesh': 2,
+    'meshes': 2,
+    'Curve': 2,
+    'curves': 2,
+    'Armature': 2,
+    'armatures': 2,
+    'Camera': 2,
+    'cameras': 2,
+    'Light': 2,
+    'lights': 2,
+    'Metaball': 2,
+    'metaballs': 2,
+    'Lattice': 2,
+    'lattices': 2,
+    'Font': 2,
+    'fonts': 2,
+    'Speaker': 2,
+    'speakers': 2,
+    'LightProbe': 2,
+    'lightprobes': 2,
+    'Volume': 2,
+    'volumes': 2,
+    'GreasePencil': 2,
+    'grease_pencils': 2,
+    'Object': 3,
+    'objects': 3,
+    'Collection': 4,
+    'collections': 4,
+    'Scene': 5,
+    'scenes': 5,
+    'World': 5,
+    'worlds': 5,
+}
+OBJECT_TYPE_IDS = frozenset({'Object', 'objects'})
+MESH_TYPE_IDS = frozenset({'Mesh', 'meshes'})
+MESH_OBJECT_TYPES = frozenset({'MESH'})
+HIERARCHY_TYPE_IDS = frozenset({
+    'Scene', 'scenes', 'Collection', 'collections', 'World', 'worlds',
+})
 TEXTURE_SHADING_TYPES = frozenset({'MATERIAL', 'RENDERED'})
 
 
@@ -380,8 +431,231 @@ def get_asset_sync_progress() -> tuple[int, int]:
     return (applied, total)
 
 
-def is_deferred_asset_type(type_id: str | None) -> bool:
-    return type_id in ASSET_TYPE_IDS
+def is_mesh_geometry_loaded(node_ref) -> bool:
+    """True when a mesh node has its vertex data applied."""
+    if not node_ref or not node_ref.data:
+        return False
+    if node_ref.data.get('type_id') not in MESH_TYPE_IDS:
+        return True
+    vertex_count = node_ref.data.get('vertex_count', 0)
+    if vertex_count <= 0:
+        return True
+    mesh = node_ref.instance
+    return isinstance(mesh, bpy.types.Mesh) and len(mesh.vertices) > 0
+
+
+def repair_incomplete_meshes(repository) -> int:
+    """Re-queue meshes marked UP but still missing geometry."""
+    if repository is None:
+        return 0
+
+    from replication.constants import FETCHED, UP
+
+    repaired = 0
+    for node in repository.graph.values():
+        if not node.data or node.data.get('type_id') not in MESH_TYPE_IDS:
+            continue
+        if node.state != UP:
+            continue
+        if is_mesh_geometry_loaded(node):
+            continue
+        node.state = FETCHED
+        repaired += 1
+    return repaired
+
+
+def count_scene_linked_objects(scene: bpy.types.Scene) -> int:
+    """Count objects linked under a scene's master collection tree."""
+    def count_collection(collection: bpy.types.Collection) -> int:
+        total = len(collection.objects)
+        for child in collection.children:
+            total += count_collection(child)
+        return total
+
+    try:
+        return count_collection(scene.collection)
+    except Exception:
+        return len(scene.objects)
+
+
+def get_scene_apply_progress() -> tuple[int, int]:
+    """Return (applied, total) for non-asset datablocks still in FETCHED state."""
+    from replication.interface import session
+
+    if not session or not getattr(session, 'repository', None):
+        return (0, 0)
+
+    total = 0
+    applied = 0
+    for node in session.repository.graph.values():
+        if not node.data:
+            continue
+        type_id = node.data.get('type_id')
+        if type_id in ASSET_TYPE_IDS:
+            continue
+        total += 1
+        if node.state != FETCHED:
+            applied += 1
+    return (applied, total)
+
+
+def build_index_sorted_ranks(repository) -> dict[str, int]:
+    """Map node UUID to topological apply rank from the replication graph."""
+    index_sorted = getattr(repository, 'index_sorted', None)
+    if not index_sorted:
+        return {}
+    if not isinstance(index_sorted, (list, tuple)):
+        index_sorted = list(index_sorted)
+    return {uuid: rank for rank, uuid in enumerate(index_sorted)}
+
+
+def asset_apply_sort_key(
+    type_id: str | None,
+    node_uuid: str,
+    index_ranks: dict[str, int],
+) -> tuple[int, int, int]:
+    """Sort datablocks: assets, then geometry data, objects, collections, scene."""
+    rank = index_ranks.get(node_uuid, len(index_ranks))
+    if type_id in ASSET_TYPE_IDS:
+        return (0, ASSET_APPLY_ORDER.get(type_id, 99), rank)
+    tier = APPLY_TYPE_TIER.get(type_id, 2)
+    return (tier, rank, 0)
+
+
+def is_object_apply_ready(node_ref, repository) -> bool:
+    """True when an Object node's data dependency is loaded enough to construct."""
+    from replication.constants import UP
+
+    data = node_ref.data if node_ref else None
+    if not data or data.get('type_id') not in OBJECT_TYPE_IDS:
+        return True
+
+    obj_type = data.get('type')
+    if obj_type == 'EMPTY':
+        return True
+
+    data_uuid = data.get('data_uuid')
+    if not data_uuid:
+        return True
+
+    dep_node = repository.graph.get(data_uuid)
+    if dep_node is None:
+        return False
+    if dep_node.state != UP:
+        return False
+
+    if obj_type not in MESH_OBJECT_TYPES:
+        return dep_node.instance is not None
+
+    mesh = dep_node.instance
+    if mesh is None:
+        return False
+    return is_mesh_geometry_loaded(dep_node)
+
+
+def refresh_scene_hierarchy(repository) -> int:
+    """Re-apply collections and scenes so late-arriving objects get linked."""
+    from replication import porcelain
+    from . import shared_data
+
+    if repository is None:
+        return 0
+
+    collection_nodes = []
+    scene_nodes = []
+    for node in repository.graph.values():
+        if not node.data or node.state != UP or node.instance is None:
+            continue
+        type_id = node.data.get('type_id')
+        if type_id in ('Collection', 'collections'):
+            collection_nodes.append(node)
+        elif type_id in ('Scene', 'scenes'):
+            scene_nodes.append(node)
+
+    refreshed = 0
+    for node in collection_nodes:
+        try:
+            shared_data.session.applied_updates.append(node.uuid)
+            porcelain.apply(repository, node.uuid, force=True)
+            refreshed += 1
+        except Exception:
+            logging.debug("Failed to refresh collection %s", node.uuid)
+
+    for node in scene_nodes:
+        try:
+            shared_data.session.applied_updates.append(node.uuid)
+            porcelain.apply(repository, node.uuid, force=True)
+            refreshed += 1
+        except Exception:
+            logging.debug("Failed to refresh scene %s", node.uuid)
+
+    if refreshed:
+        network_log(logging.INFO, "Refreshed scene hierarchy (%s node(s))", refreshed)
+    return refreshed
+
+
+def has_pending_fetched_assets(repository) -> bool:
+    if repository is None:
+        return False
+    for node in repository.graph.values():
+        if node.state != FETCHED or not node.data:
+            continue
+        if node.data.get('type_id') in ASSET_TYPE_IDS:
+            return True
+    return False
+
+
+def has_pending_fetched_asset_type(repository, type_ids: set[str] | frozenset[str]) -> bool:
+    if repository is None:
+        return False
+    for node in repository.graph.values():
+        if node.state != FETCHED or not node.data:
+            continue
+        if node.data.get('type_id') in type_ids:
+            return True
+    return False
+
+
+def log_replication_graph_summary(repository, label: str = "graph") -> None:
+    """Log datablock counts by replication state and asset readiness."""
+    if repository is None:
+        return
+
+    from replication.constants import FETCHED, UP
+
+    type_counts: dict[str, dict[str, int]] = {}
+    asset_details = []
+
+    for node in repository.graph.values():
+        if not node.data:
+            continue
+        type_id = node.data.get('type_id', 'unknown')
+        state_name = {FETCHED: 'FETCHED', UP: 'UP'}.get(node.state, str(node.state))
+        type_counts.setdefault(type_id, {})
+        type_counts[type_id][state_name] = type_counts[type_id].get(state_name, 0) + 1
+
+        if type_id not in ASSET_TYPE_IDS:
+            continue
+
+        name = node.data.get('name', '?')
+        instance = node.instance
+        extra = ''
+        if type_id == 'Image' and instance is not None:
+            filepath = getattr(instance, 'filepath', '')
+            packed = getattr(instance, 'packed_file', None) is not None
+            extra = f" filepath={filepath!r} users={instance.users} fake={instance.use_fake_user} packed={packed}"
+        elif type_id == 'Material' and instance is not None:
+            extra = f" users={instance.users} fake={instance.use_fake_user} use_nodes={instance.use_nodes}"
+        elif type_id in ('WindowsPath', 'PosixPath'):
+            extra = f" path={node.data.get('name', '?')}"
+
+        asset_details.append(
+            f"  {type_id} {name!r} state={state_name} instance={'yes' if instance else 'no'}{extra}"
+        )
+
+    network_log(logging.INFO, "%s summary: %s", label, type_counts)
+    for line in asset_details:
+        network_log(logging.INFO, line)
 
 
 def textures_fetch_enabled(context: bpy.types.Context | None = None) -> bool:
@@ -391,13 +665,19 @@ def textures_fetch_enabled(context: bpy.types.Context | None = None) -> bool:
 
 
 def enable_textures_fetch(context: bpy.types.Context | None = None) -> bool:
-    """Enable deferred texture/material sync after user picks Material/Rendered shading."""
+    """Enable material/image sync tracking for UI progress and node-tree finalization."""
     ctx = context or bpy.context
     runtime = getattr(ctx.window_manager, 'session', None)
     if runtime is None or runtime.textures_fetch_enabled:
         return False
     runtime.textures_fetch_enabled = True
     return True
+
+
+def ensure_client_asset_sync(context: bpy.types.Context | None = None) -> None:
+    """Start syncing images and materials as soon as a client joins a session."""
+    if enable_textures_fetch(context):
+        network_log(logging.INFO, "Material and image sync enabled for client session")
 
 
 def reset_textures_fetch_state(context: bpy.types.Context | None = None) -> None:
@@ -485,6 +765,87 @@ def clean_scene():
 
     # Clear sequencer
     bpy.context.scene.sequence_editor_clear()
+
+
+def switch_client_to_host_scene(repository) -> bool:
+    """Make a client view the synced (populated) scene after the initial sync.
+
+    A client cannot start from zero scenes, so ``clean_scene()`` leaves a local
+    empty "bootstrap" scene behind. The host's real scene arrives as a separate
+    datablock (and is renamed, e.g. ``Scene.001``) which means the client keeps
+    looking at the empty local scene and sees nothing even though every
+    datablock was fetched correctly. This points all windows at the populated
+    synced scene and removes the now-useless bootstrap scene.
+
+    Returns ``True`` once the view was switched to a non-empty synced scene.
+    """
+    if repository is None:
+        return False
+
+    from . import shared_data
+    from replication import porcelain
+
+    synced_scenes = []
+    for node in repository.graph.values():
+        if not node.data or node.data.get('type_id') != 'Scene':
+            continue
+        instance = node.instance
+        if isinstance(instance, bpy.types.Scene):
+            synced_scenes.append(instance)
+
+    if not synced_scenes:
+        return False
+
+    def _obj_count(scene):
+        return count_scene_linked_objects(scene)
+
+    # Prefer the scene with the most linked content (not bpy.data orphans).
+    target = max(synced_scenes, key=_obj_count)
+    if _obj_count(target) == 0:
+        refresh_scene_hierarchy(repository)
+        target = max(synced_scenes, key=_obj_count)
+    if _obj_count(target) == 0:
+        return False
+
+    switched = False
+    try:
+        windows = bpy.context.window_manager.windows
+    except Exception:
+        windows = []
+    for window in windows:
+        try:
+            if window.scene is not target:
+                window.scene = target
+                switched = True
+        except Exception:
+            continue
+
+    # Drop the leftover empty bootstrap scene so it stops polluting the session.
+    bootstrap_name = shared_data.session.bootstrap_scene_name
+    if bootstrap_name and bootstrap_name != target.name:
+        leftover = bpy.data.scenes.get(bootstrap_name)
+        if (
+            leftover is not None
+            and leftover is not target
+            and _obj_count(leftover) == 0
+            and len(bpy.data.scenes) > 1
+        ):
+            leftover_uuid = getattr(leftover, 'uuid', None)
+            if leftover_uuid and repository.graph.get(leftover_uuid) is not None:
+                try:
+                    porcelain.rm(
+                        repository,
+                        leftover_uuid,
+                        remove_dependencies=False,
+                    )
+                except Exception:
+                    logging.debug("Could not remove bootstrap scene node")
+            try:
+                bpy.data.scenes.remove(leftover)
+            except Exception:
+                logging.debug("Could not remove leftover bootstrap scene")
+
+    return switched or _obj_count(target) > 0
 
 
 def get_selected_objects(scene, active_view_layer):

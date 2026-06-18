@@ -37,3 +37,9 @@ def resolve_datablock_from_uuid(uuid, bpy_collection):
         if getattr(item, 'uuid', None) == uuid:
             return item
     return None
+
+
+def preserve_replicated_datablock(datablock) -> None:
+    """Keep synced datablocks alive until scene objects reference them."""
+    if datablock is not None and hasattr(datablock, 'use_fake_user'):
+        datablock.use_fake_user = True
