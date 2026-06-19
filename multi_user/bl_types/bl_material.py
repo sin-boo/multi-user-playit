@@ -617,6 +617,12 @@ def resolve_node_group_refs(node_tree_data: dict, target_node_tree: bpy.types.No
                 node_id,
                 node_tree_uuid,
             )
+            network_log(
+                logging.WARNING,
+                "Node %s references missing node group %s",
+                node_id,
+                node_tree_uuid,
+            )
             continue
         if target_node.node_tree != node_group:
             target_node.node_tree = node_group
@@ -1126,6 +1132,12 @@ def register_scene_material_assets(repository) -> dict[str, int]:
                 stats['missing_groups'] += 1
                 logging.warning(
                     "Material %s references node group %s not registered for sync",
+                    material.name,
+                    node.node_tree.name,
+                )
+                network_log(
+                    logging.WARNING,
+                    "Material %s references node group %r not registered for sync",
                     material.name,
                     node.node_tree.name,
                 )

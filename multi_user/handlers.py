@@ -24,7 +24,15 @@ from replication.constants import RP_COMMON, STATE_ACTIVE, STATE_SYNCING, UP
 from replication.exception import ContextError, NonAuthorizedOperationError
 from replication.interface import session
 
-from . import shared_data, utils
+from . import shared_data
+from . import utils
+
+_host_external_deps_skip_logged = False
+
+
+def reset_handler_diagnostic_flags():
+    global _host_external_deps_skip_logged
+    _host_external_deps_skip_logged = False
 
 
 def sanitize_deps_graph(remove_nodes: bool = False):
@@ -51,8 +59,16 @@ def sanitize_deps_graph(remove_nodes: bool = False):
 
 def update_external_dependencies():
     """Force external dependencies (files such as images) evaluation on the host."""
+    global _host_external_deps_skip_logged
     runtime = getattr(bpy.context.window_manager, 'session', None)
     if runtime and not getattr(runtime, 'is_host', False):
+        if utils.get_connected_session_info().get('is_host') and not _host_external_deps_skip_logged:
+            utils.network_log(
+                logging.WARNING,
+                "update_external_dependencies skipped: wm.session.is_host=False but "
+                "connected_session_info.is_host=True (host file push may not run on deps updates)",
+            )
+            _host_external_deps_skip_logged = True
         return
 
     external_types = ['WindowsPath', 'PosixPath', 'Image']

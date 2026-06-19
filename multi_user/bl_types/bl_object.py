@@ -648,7 +648,11 @@ class BlObject(ReplicatedDatablock):
             loader.load(datablock.cycles_visibility, data['cycles_visibility'])
 
         if hasattr(datablock, 'modifiers'):
+            modifier_count = len(data.get('modifiers', []))
             load_modifiers(data['modifiers'], datablock.modifiers)
+            if modifier_count:
+                from ..utils import log_modifier_load_diagnostics
+                log_modifier_load_diagnostics(datablock.name, datablock.modifiers)
 
         if hasattr(object_data, 'skin_vertices') \
                 and object_data.skin_vertices\

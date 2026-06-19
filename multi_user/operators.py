@@ -170,14 +170,33 @@ def initialize_session():
     """
     runtime_settings = bpy.context.window_manager.session
 
+    utils.log_session_role_diagnostics()
+
     if not runtime_settings.is_host:
+        if utils.get_connected_session_info().get('is_host'):
+            utils.network_log(
+                logging.WARNING,
+                "Client init path running while connected_session_info.is_host=True "
+                "(wm.session.is_host=False — typical when hosting via Host button)",
+            )
         logging.info("Intializing the scene")
+        utils.network_log(logging.INFO, "Client connect: running client scene init path")
         reset_node_tree_finalize_state()
         utils.ensure_client_asset_sync()
         if session and getattr(session, 'repository', None):
             utils.log_replication_graph_summary(
                 session.repository,
                 label="post-connect",
+            )
+    else:
+        utils.network_log(
+            logging.INFO,
+            "Host connect: skipping client scene init path (wm.session.is_host=True)",
+        )
+        if session and getattr(session, 'repository', None):
+            utils.log_pending_sync_datablocks(
+                session.repository,
+                "host post-connect",
             )
 
     logging.info("Registering timers")
@@ -199,6 +218,13 @@ def on_connection_end(reason="none"):
     global deleyables, stop_modal_executor
 
     utils.network_log(logging.INFO, "session disconnected, reason: %s", reason)
+    utils.log_warning_error_summary("session disconnect")
+    from .handlers import reset_handler_diagnostic_flags
+    reset_handler_diagnostic_flags()
+    try:
+        bpy.context.window_manager.session.is_host = False
+    except Exception:
+        pass
     utils.clear_connected_session_info()
     utils.reset_textures_fetch_state()
     reset_node_tree_finalize_state()
@@ -381,6 +407,7 @@ class SessionJoinOperator(bpy.types.Operator):
             shared_data.session.bootstrap_scene_name = None
 
         try:
+            context.window_manager.session.is_host = False
             utils.set_connected_session_info(
                 active_server.ip,
                 active_server.port,
@@ -465,6 +492,7 @@ class SessionHostOperator(bpy.types.Operator):
             utils.clean_scene()
 
         try:
+            context.window_manager.session.is_host = True
             utils.set_connected_session_info(
                 "127.0.0.1",
                 settings.host_port,
@@ -472,6 +500,11 @@ class SessionHostOperator(bpy.types.Operator):
                 use_server_password=settings.host_use_server_password,
                 use_admin_password=settings.host_use_admin_password,
                 is_host=True,
+            )
+            utils.network_log(
+                logging.INFO,
+                "Host operator: wm.session.is_host=%s before repository init",
+                context.window_manager.session.is_host,
             )
             # Init repository
             for scene in bpy.data.scenes:

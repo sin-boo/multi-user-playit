@@ -146,12 +146,9 @@ class SessionListenTimer(Timer):
             key = (progress.get('current', -1), progress.get('total', -1))
             if key != SessionListenTimer._last_fetch_progress:
                 SessionListenTimer._last_fetch_progress = key
-                utils.network_log(
-                    logging.INFO,
-                    "fetch progress %s/%s",
-                    key[0],
-                    key[1],
-                )
+                utils.network_log_fetch_progress(key[0], key[1])
+        else:
+            SessionListenTimer._last_fetch_progress = (-1, -1)
         session.listen()
 
 
@@ -165,6 +162,10 @@ class ApplyTimer(Timer):
     _sync_hierarchy_done = False
     _material_graph_repair_done = False
     _material_slots_refreshed = False
+    _logged_visibility_post_hierarchy = False
+    _logged_visibility_post_repair = False
+    _logged_host_scene_switch_skip = False
+    _host_echo_promoted_total = 0
     _next_interval: float | None = None
     _MAX_APPLY_RETRIES = 3
     _MAX_HIERARCHY_RETRIES = 12
@@ -218,6 +219,10 @@ class ApplyTimer(Timer):
         cls._sync_hierarchy_done = False
         cls._material_graph_repair_done = False
         cls._material_slots_refreshed = False
+        cls._logged_visibility_post_hierarchy = False
+        cls._logged_visibility_post_repair = False
+        cls._logged_host_scene_switch_skip = False
+        cls._host_echo_promoted_total = 0
 
     def execute(self):
         if not session or session.state != STATE_ACTIVE:
@@ -241,7 +246,10 @@ class ApplyTimer(Timer):
         applied = 0
         pending_assets = utils.has_pending_fetched_assets(session.repository)
 
-        repaired_meshes = utils.repair_incomplete_meshes(session.repository)
+        initial_sync_active = not ApplyTimer._sync_hierarchy_done
+        repaired_meshes = 0
+        if not utils.is_session_host():
+            repaired_meshes = utils.repair_incomplete_meshes(session.repository)
         if repaired_meshes:
             utils.network_log(
                 logging.INFO,
@@ -354,6 +362,15 @@ class ApplyTimer(Timer):
                     continue
 
             block_name = node_ref.data.get('name', '?') if node_ref.data else '?'
+
+            if utils.should_skip_host_echo_apply(node_ref, initial_sync_active):
+                utils.promote_fetched_node_to_up(node_ref)
+                ApplyTimer._host_echo_promoted_total += 1
+                ApplyTimer._failed_apply_nodes.pop(node_ref.uuid, None)
+                ApplyTimer._deferred_nodes.pop(node_ref.uuid, None)
+                applied += 1
+                continue
+
             utils.network_log(
                 logging.INFO,
                 "Applying %s %r (uuid=%s)",
@@ -396,6 +413,11 @@ class ApplyTimer(Timer):
                 ApplyTimer._failed_apply_nodes.pop(node_ref.uuid, None)
                 ApplyTimer._deferred_nodes.pop(node_ref.uuid, None)
                 applied += 1
+                if type_id in utils.OBJECT_TYPE_IDS and node_ref.instance is not None:
+                    utils.log_object_apply_diagnostics(
+                        node_ref.instance,
+                        label=f"after apply {block_name!r}",
+                    )
                 if type_id == 'ShaderNodeTree' and not ApplyTimer._sync_hierarchy_done:
                     reset_material_finalize_state()
                 impl = session.repository.rdp.get_implementation(node_ref.instance)
@@ -528,10 +550,24 @@ class ApplyTimer(Timer):
             and not initial_sync_pending
             and not ApplyTimer._sync_hierarchy_done
         ):
-            try:
-                utils.refresh_scene_hierarchy(session.repository)
-            except Exception:
-                logging.exception("Failed to refresh scene hierarchy")
+            if utils.is_session_host():
+                ApplyTimer._sync_hierarchy_done = True
+                if ApplyTimer._host_echo_promoted_total:
+                    utils.network_log(
+                        logging.INFO,
+                        "Host initial sync: promoted %s local datablock(s) without "
+                        "destructive re-apply",
+                        ApplyTimer._host_echo_promoted_total,
+                    )
+                utils.network_log(
+                    logging.INFO,
+                    "Host: skipped hierarchy force-reapply (local scene is authoritative)",
+                )
+            else:
+                try:
+                    utils.refresh_scene_hierarchy(session.repository)
+                except Exception:
+                    logging.exception("Failed to refresh scene hierarchy")
 
             has_linked_scene = any(
                 node.data
@@ -540,9 +576,15 @@ class ApplyTimer(Timer):
                 and utils.count_scene_linked_objects(node.instance) > 0
                 for node in session.repository.graph.values()
             )
-            if has_linked_scene:
+            if has_linked_scene and not ApplyTimer._sync_hierarchy_done:
                 ApplyTimer._sync_hierarchy_done = True
                 utils.network_log(logging.INFO, "Initial scene hierarchy linked")
+            if ApplyTimer._sync_hierarchy_done and not ApplyTimer._logged_visibility_post_hierarchy:
+                utils.log_scene_visibility_audit(
+                    "post-hierarchy",
+                    session.repository,
+                )
+                ApplyTimer._logged_visibility_post_hierarchy = True
 
         if (
             ApplyTimer._sync_hierarchy_done
@@ -585,6 +627,13 @@ class ApplyTimer(Timer):
                     logging.INFO,
                     "Material slot refresh after graph repair: no mesh slot changes",
                 )
+            if not ApplyTimer._logged_visibility_post_repair:
+                utils.log_scene_visibility_audit(
+                    "post-material-repair",
+                    session.repository,
+                )
+                utils.log_warning_error_summary("post-material-repair")
+                ApplyTimer._logged_visibility_post_repair = True
             ApplyTimer._material_slots_refreshed = True
 
         if (
@@ -604,15 +653,36 @@ class ApplyTimer(Timer):
 
         if not pending_assets_after and not initial_sync_pending:
             runtime = getattr(bpy.context.window_manager, 'session', None)
-            is_host = bool(runtime and runtime.is_host)
-            if not is_host:
+            is_host = utils.is_session_host()
+            if is_host:
+                if not ApplyTimer._logged_host_scene_switch_skip:
+                    ApplyTimer._logged_host_scene_switch_skip = True
+                    utils.network_log(
+                        logging.DEBUG,
+                        "client scene switch skipped (host session)",
+                    )
+            else:
+                if utils.get_connected_session_info().get('is_host'):
+                    utils.network_log(
+                        logging.WARNING,
+                        "client scene switch path active while connected_session_info "
+                        "says host (wm.session.is_host=False)",
+                    )
                 try:
                     active = bpy.context.window.scene
                     needs_switch = (
                         not shared_data.session.client_scene_switched
                         or (active is not None and utils.count_scene_linked_objects(active) == 0)
                     )
-                    if needs_switch and utils.switch_client_to_host_scene(
+                    if not needs_switch:
+                        utils.network_log(
+                            logging.DEBUG,
+                            "client scene switch not needed (scene=%r linked=%s switched=%s)",
+                            active.name if active else None,
+                            utils.count_scene_linked_objects(active) if active else 0,
+                            shared_data.session.client_scene_switched,
+                        )
+                    elif needs_switch and utils.switch_client_to_host_scene(
                         session.repository,
                     ):
                         shared_data.session.client_scene_switched = True
@@ -620,8 +690,24 @@ class ApplyTimer(Timer):
                             logging.INFO,
                             "Switched client view to the synced host scene",
                         )
+                        utils.log_scene_visibility_audit(
+                            "post-client-scene-switch",
+                            session.repository,
+                        )
+                    elif needs_switch:
+                        utils.network_log(
+                            logging.WARNING,
+                            "client scene switch needed but switch_client_to_host_scene "
+                            "returned False (active=%r linked=%s)",
+                            active.name if active else None,
+                            utils.count_scene_linked_objects(active) if active else 0,
+                        )
                 except Exception:
                     logging.exception("Failed to switch client to host scene")
+                    utils.network_log(
+                        logging.ERROR,
+                        "Failed to switch client to host scene — see traceback in log file",
+                    )
 
         remaining_fetched = utils.count_fetched_datablocks(session.repository)
         more_candidates = len(candidates) > applied

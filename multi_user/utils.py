@@ -46,6 +46,15 @@ _connected_session_info = {
 _session_log_path = ""
 _network_log_buffer = []
 _NETWORK_LOG_BUFFER_MAX = 2000
+_warning_log_buffer = []
+_WARNING_LOG_BUFFER_MAX = 200
+_FETCH_PROGRESS_STATE = {
+    'active': False,
+    'total': 0,
+    'suppressed_steps': 0,
+    'milestones_logged': set(),
+}
+_network_log_aggregates: dict[str, dict] = {}
 SESSION_STATE_LABELS = {
     STATE_INITIAL: "OFFLINE",
     STATE_AUTH: "AUTHENTICATION",
@@ -75,6 +84,388 @@ def network_log(level, message, *args):
     _network_log_buffer.append(line)
     if len(_network_log_buffer) > _NETWORK_LOG_BUFFER_MAX:
         del _network_log_buffer[:len(_network_log_buffer) - _NETWORK_LOG_BUFFER_MAX]
+    if level >= logging.WARNING:
+        _warning_log_buffer.append(line)
+        if len(_warning_log_buffer) > _WARNING_LOG_BUFFER_MAX:
+            del _warning_log_buffer[:len(_warning_log_buffer) - _WARNING_LOG_BUFFER_MAX]
+
+
+def reset_diagnostic_log_state():
+    """Clear collapsed-progress and warning buffers (e.g. on disconnect)."""
+    global _warning_log_buffer, _network_log_aggregates
+    _warning_log_buffer = []
+    _network_log_aggregates = {}
+    reset_fetch_progress_log()
+    flush_all_network_log_aggregates("session end")
+
+
+def network_log_aggregate(key: str, level: int, message: str, *args):
+    """Count repeated log lines; only the first occurrence is written immediately."""
+    state = _network_log_aggregates.setdefault(key, {'count': 0, 'message': message, 'args': args})
+    state['count'] += 1
+    if state['count'] == 1:
+        network_log(level, message, *args)
+
+
+def flush_network_log_aggregate(key: str, level: int, summary_message: str):
+    """Emit a summary for a collapsed repeated log series."""
+    state = _network_log_aggregates.pop(key, None)
+    if not state or state['count'] <= 1:
+        return
+    network_log(
+        level,
+        "%s (collapsed %s similar log lines; last: %s)",
+        summary_message,
+        state['count'] - 1,
+        state['message'] % state['args'] if state['args'] else state['message'],
+    )
+
+
+def flush_all_network_log_aggregates(context_label: str):
+    """Flush all active aggregate counters with summaries."""
+    keys = list(_network_log_aggregates.keys())
+    for key in keys:
+        state = _network_log_aggregates.get(key)
+        if not state:
+            continue
+        count = state['count']
+        if count <= 1:
+            _network_log_aggregates.pop(key, None)
+            continue
+        network_log(
+            logging.INFO,
+            "%s: %s — %s occurrence(s) (individual lines collapsed)",
+            context_label,
+            key,
+            count,
+        )
+        _network_log_aggregates.pop(key, None)
+
+
+def reset_fetch_progress_log():
+    _FETCH_PROGRESS_STATE['active'] = False
+    _FETCH_PROGRESS_STATE['total'] = 0
+    _FETCH_PROGRESS_STATE['suppressed_steps'] = 0
+    _FETCH_PROGRESS_STATE['milestones_logged'] = set()
+
+
+def network_log_fetch_progress(current: int, total: int):
+    """Log fetch/push progress at milestones instead of every single step."""
+    if total <= 0:
+        network_log(logging.INFO, "fetch progress %s/?", current)
+        return
+
+    state = _FETCH_PROGRESS_STATE
+    if not state['active'] or state['total'] != total:
+        if state['active'] and state['suppressed_steps']:
+            network_log(
+                logging.INFO,
+                "fetch progress segment ended (%s step updates collapsed)",
+                state['suppressed_steps'],
+            )
+        reset_fetch_progress_log()
+        state['active'] = True
+        state['total'] = total
+        state['milestones_logged'].add(0)
+        network_log(logging.INFO, "fetch progress started 0/%s", total)
+
+    if current < 0:
+        return
+
+    milestone_pcts = (25, 50, 75, 100)
+    milestone_values = {0, total}
+    for pct in milestone_pcts:
+        milestone_values.add(max(0, min(total, int(total * pct / 100))))
+    if total > 0:
+        milestone_values.add(total - 1)
+
+    if current in milestone_values and current not in state['milestones_logged']:
+        state['milestones_logged'].add(current)
+        pct = int(100 * current / total) if total else 0
+        network_log(
+            logging.INFO,
+            "fetch progress %s/%s (%s%%)",
+            current,
+            total,
+            pct,
+        )
+    else:
+        state['suppressed_steps'] += 1
+
+    if current >= total:
+        suppressed = state['suppressed_steps']
+        network_log(
+            logging.INFO,
+            "fetch progress complete %s/%s (%s intermediate updates not logged)",
+            total,
+            total,
+            suppressed,
+        )
+        reset_fetch_progress_log()
+
+
+def log_warning_error_summary(label: str, max_lines: int = 20):
+    """Surface recent WARNING/ERROR lines from the network log buffer."""
+    if not _warning_log_buffer:
+        network_log(
+            logging.INFO,
+            "%s: no WARNING/ERROR lines in network log buffer yet",
+            label,
+        )
+        return
+    network_log(
+        logging.WARNING,
+        "%s: %s WARNING/ERROR line(s) in network log buffer (showing last %s):",
+        label,
+        len(_warning_log_buffer),
+        min(max_lines, len(_warning_log_buffer)),
+    )
+    for line in _warning_log_buffer[-max_lines:]:
+        network_log(logging.WARNING, "  %s", line.replace("[MULTIUSER-NET] ", "", 1))
+
+
+def log_session_role_diagnostics(context: bpy.types.Context | None = None):
+    """Log host/client flags — mismatches here can change sync behavior."""
+    ctx = context or bpy.context
+    runtime = getattr(ctx.window_manager, 'session', None)
+    wm_is_host = getattr(runtime, 'is_host', None) if runtime is not None else None
+    info = get_connected_session_info(ctx)
+    info_is_host = info.get('is_host')
+    network_log(
+        logging.INFO,
+        "session role: wm.session.is_host=%s connected_session_info.is_host=%s "
+        "textures_fetch_enabled=%s active_scene=%r",
+        wm_is_host,
+        info_is_host,
+        textures_fetch_enabled(ctx),
+        getattr(ctx.window.scene, 'name', None) if ctx.window else None,
+    )
+    if wm_is_host is not info_is_host:
+        network_log(
+            logging.WARNING,
+            "session role mismatch: window_manager.session.is_host (%s) != "
+            "connected_session_info.is_host (%s) — client init paths may run on host",
+            wm_is_host,
+            info_is_host,
+        )
+
+
+def is_session_host(context: bpy.types.Context | None = None) -> bool:
+    """True when this Blender instance is hosting (not a remote client)."""
+    ctx = context or bpy.context
+    runtime = getattr(ctx.window_manager, 'session', None)
+    if runtime is not None and getattr(runtime, 'is_host', False):
+        return True
+    return bool(get_connected_session_info(ctx).get('is_host'))
+
+
+def should_skip_host_echo_apply(node_ref, initial_sync_active: bool) -> bool:
+    """Skip destructive re-apply when the host echoes its own pushed snapshot."""
+    if not is_session_host():
+        return False
+    if not initial_sync_active:
+        return False
+    if node_ref is None or node_ref.instance is None or not node_ref.data:
+        return False
+    type_id = node_ref.data.get('type_id')
+    if type_id in FILE_ASSET_TYPE_IDS | {'Image'}:
+        return False
+    return True
+
+
+def promote_fetched_node_to_up(node_ref) -> None:
+    """Mark a FETCHED replication node UP without running load()."""
+    from replication.constants import UP
+
+    node_ref.state = UP
+
+
+def log_pending_sync_datablocks(repository, label: str, max_names: int = 15):
+    """List datablocks still in FETCHED state (not yet applied)."""
+    if repository is None:
+        return
+
+    from replication.constants import FETCHED
+
+    by_type: dict[str, list[str]] = {}
+    for node in repository.graph.values():
+        if node.state != FETCHED or not node.data:
+            continue
+        type_id = node.data.get('type_id', 'unknown')
+        name = node.data.get('name', node.uuid)
+        by_type.setdefault(type_id, []).append(str(name))
+
+    if not by_type:
+        network_log(logging.INFO, "%s: no FETCHED datablocks pending apply", label)
+        return
+
+    total = sum(len(names) for names in by_type.values())
+    network_log(
+        logging.WARNING,
+        "%s: %s datablock(s) still FETCHED (not applied): %s",
+        label,
+        total,
+        {k: len(v) for k, v in sorted(by_type.items())},
+    )
+    for type_id, names in sorted(by_type.items()):
+        shown = names[:max_names]
+        suffix = f" ... +{len(names) - max_names} more" if len(names) > max_names else ""
+        network_log(
+            logging.WARNING,
+            "  %s: %s%s",
+            type_id,
+            ', '.join(shown),
+            suffix,
+        )
+
+
+def log_scene_visibility_audit(
+    label: str,
+    repository=None,
+    context: bpy.types.Context | None = None,
+    max_issues: int = 25,
+):
+    """Scan the active scene for common reasons geometry might not show in the viewport."""
+    ctx = context or bpy.context
+    try:
+        scene = ctx.window.scene
+    except Exception:
+        network_log(logging.WARNING, "%s visibility audit: no window context", label)
+        return
+
+    if scene is None:
+        network_log(logging.WARNING, "%s visibility audit: no active scene", label)
+        return
+
+    runtime = getattr(ctx.window_manager, 'session', None)
+    linked = count_scene_linked_objects(scene)
+    network_log(
+        logging.INFO,
+        "%s visibility audit: scene=%r scene.objects=%s linked_in_tree=%s "
+        "wm.is_host=%s session_info.is_host=%s",
+        label,
+        scene.name,
+        len(scene.objects),
+        linked,
+        getattr(runtime, 'is_host', None) if runtime is not None else None,
+        get_connected_session_info(ctx).get('is_host'),
+    )
+
+    issues: list[str] = []
+    try:
+        view_layer = ctx.view_layer
+    except Exception:
+        view_layer = None
+
+    for obj in scene.objects:
+        reasons: list[str] = []
+        if obj.hide_viewport:
+            reasons.append('hide_viewport')
+        if view_layer is not None:
+            try:
+                if obj.hide_get(view_layer=view_layer):
+                    reasons.append('hide_in_view_layer')
+            except Exception:
+                pass
+        if obj.display_type != 'TEXTURED':
+            reasons.append(f'display_type={obj.display_type}')
+        if obj.type == 'MESH' and obj.data is not None and len(obj.data.vertices) == 0:
+            reasons.append('mesh_0_vertices')
+        if obj.type == 'MESH' and obj.data is None:
+            reasons.append('mesh_data_missing')
+        for mod in getattr(obj, 'modifiers', []):
+            if mod.type == 'NODES' and not getattr(mod, 'node_group', None):
+                reasons.append(f'gn_{mod.name}_no_node_tree')
+            if mod.type == 'BOOLEAN':
+                operand = getattr(mod, 'object', None)
+                if operand is None:
+                    reasons.append(f'bool_{mod.name}_no_operand')
+                elif operand.hide_viewport:
+                    reasons.append(f'bool_{mod.name}_operand_hidden')
+        if reasons:
+            issues.append(f"  {obj.name!r} ({obj.type}): {', '.join(reasons)}")
+
+    if issues:
+        network_log(
+            logging.WARNING,
+            "%s visibility audit: %s object(s) with possible viewport issues:",
+            label,
+            len(issues),
+        )
+        for line in issues[:max_issues]:
+            network_log(logging.WARNING, line)
+        if len(issues) > max_issues:
+            network_log(
+                logging.WARNING,
+                "  ... and %s more object(s) with issues",
+                len(issues) - max_issues,
+            )
+    else:
+        network_log(
+            logging.INFO,
+            "%s visibility audit: no obvious viewport issues in scene.objects",
+            label,
+        )
+
+    if repository is not None:
+        log_pending_sync_datablocks(repository, f"{label} (pending apply)")
+
+
+def log_object_apply_diagnostics(obj: bpy.types.Object, label: str):
+    """Log only when an applied object has traits that often hide geometry."""
+    if obj is None or not isinstance(obj, bpy.types.Object):
+        return
+
+    reasons: list[str] = []
+    if obj.hide_viewport:
+        reasons.append('hide_viewport')
+    if obj.display_type != 'TEXTURED':
+        reasons.append(f'display_type={obj.display_type}')
+    if obj.type == 'MESH':
+        if obj.data is None:
+            reasons.append('mesh_data_missing')
+        elif len(obj.data.vertices) == 0:
+            reasons.append('mesh_0_vertices')
+    for mod in getattr(obj, 'modifiers', []):
+        if mod.type == 'NODES' and not getattr(mod, 'node_group', None):
+            reasons.append(f'gn_{mod.name}_no_node_tree')
+        if mod.type == 'BOOLEAN':
+            operand = getattr(mod, 'object', None)
+            if operand is None:
+                reasons.append(f'bool_{mod.name}_no_operand')
+            elif operand.hide_viewport:
+                reasons.append(f'bool_{mod.name}_operand_hidden')
+    if obj.instance_type == 'COLLECTION' and obj.instance_collection is None:
+        reasons.append('collection_instance_missing')
+
+    if reasons:
+        network_log(
+            logging.WARNING,
+            "%s: object %r (%s) possible visibility issue: %s",
+            label,
+            obj.name,
+            obj.type,
+            ', '.join(reasons),
+        )
+
+
+def log_modifier_load_diagnostics(object_name: str, modifiers: bpy.types.bpy_prop_collection):
+    """Log geometry/boolean modifiers that may not evaluate after reload."""
+    issues: list[str] = []
+    for mod in modifiers:
+        if mod.type == 'NODES' and not getattr(mod, 'node_group', None):
+            issues.append(f"GN '{mod.name}' has no node_tree")
+        if mod.type == 'BOOLEAN':
+            operand = getattr(mod, 'object', None)
+            if operand is None:
+                issues.append(f"Boolean '{mod.name}' has no operand object")
+    if issues:
+        network_log(
+            logging.WARNING,
+            "Modifier reload on %r: %s",
+            object_name,
+            '; '.join(issues),
+        )
 
 
 def set_session_log_file(path: str):
@@ -182,6 +573,7 @@ def set_connected_session_info(
 
 def clear_connected_session_info():
     global _connected_session_info
+    reset_diagnostic_log_state()
     _connected_session_info = {
         "host": "",
         "port": 5555,
@@ -229,6 +621,17 @@ def get_connected_session_info(context=None):
 def log_session_state_change(previous_state, current_state, reason: str = ""):
     previous = SESSION_STATE_LABELS.get(previous_state, str(previous_state))
     current = SESSION_STATE_LABELS.get(current_state, str(current_state))
+    sync_states = (STATE_SYNCING, STATE_SRV_SYNC, STATE_WAITING)
+    if previous_state in sync_states and current_state not in sync_states:
+        if _FETCH_PROGRESS_STATE['active']:
+            network_log(
+                logging.INFO,
+                "fetch progress segment ended on state change (%s step updates collapsed)",
+                _FETCH_PROGRESS_STATE['suppressed_steps'],
+            )
+        reset_fetch_progress_log()
+        if current_state == STATE_ACTIVE:
+            flush_all_network_log_aggregates("sync finished")
     network_log(logging.INFO, "session state: %s -> %s", previous, current)
     if reason:
         network_log(logging.INFO, "session detail: %s", reason)

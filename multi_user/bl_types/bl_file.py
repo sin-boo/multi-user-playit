@@ -24,6 +24,7 @@ import bpy
 from replication.protocol import ReplicatedDatablock
 
 from .. import utils
+from ..utils import network_log
 from ..utils import get_preferences
 
 
@@ -84,6 +85,7 @@ class BlFile(ReplicatedDatablock):
             disk_size = datablock.stat().st_size
         except OSError:
             logging.warning("%s doesn't exist, skipping", datablock)
+            network_log(logging.WARNING, "Texture file %s missing on disk, skipping", datablock)
             return data
 
         try:
@@ -94,6 +96,13 @@ class BlFile(ReplicatedDatablock):
             return data
 
         logging.info("Reading %s content: %s bytes", datablock.name, disk_size)
+        utils.network_log_aggregate(
+            'texture_file_read',
+            logging.INFO,
+            "Reading texture %s (%s bytes) for push",
+            datablock.name,
+            disk_size,
+        )
 
         return data
 
@@ -106,6 +115,11 @@ class BlFile(ReplicatedDatablock):
         payload = data.get('file')
         if payload is None:
             logging.warning("No file payload for %s, skipping", data.get('name', datablock))
+            network_log(
+                logging.WARNING,
+                "No file payload for %s, skipping cache write",
+                data.get('name', datablock),
+            )
             return
 
         try:
@@ -117,7 +131,9 @@ class BlFile(ReplicatedDatablock):
         except IOError:
             logging.warning(f"{datablock} doesn't exist, skipping")
         else:
-            logging.info(
+            utils.network_log_aggregate(
+                'texture_cache_write',
+                logging.INFO,
                 "Cached texture file %s (%s bytes)",
                 datablock.name,
                 len(payload),
