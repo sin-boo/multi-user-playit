@@ -12,7 +12,7 @@ Licensed under the same [GNU GPL v3](LICENSE) as the original project.
 
 ## playit.gg quick start
 
-See [scripts/playit_tunnel/SETUP.txt](scripts/playit_tunnel/SETUP.txt) for the full walkthrough. Summary:
+See [setup guide](https://multi-user-playit.mintlify.app/getting-started) for the full walkthrough. Summary:
 
 1. **Host:** Run the playit.gg agent and create a **TCP** tunnel with **port count 3**, local IP `127.0.0.1`, local port matching Blender's host port (default `5555`).
 2. **Host:** In Blender, Multi-User panel → set Port → **Host**.
