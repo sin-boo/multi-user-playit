@@ -30,7 +30,7 @@ import bpy
 from replication.constants import (CONNECTING, FETCHED, STATE_ACTIVE, STATE_AUTH,
                                    STATE_CONFIG, STATE_INITIAL, STATE_LOBBY,
                                    STATE_QUITTING, STATE_SRV_SYNC,
-                                   STATE_SYNCING, STATE_WAITING)
+                                   STATE_SYNCING, STATE_WAITING, UP)
 
 
 NETWORK_LOGGER_NAME = "multi_user.network"
@@ -603,6 +603,30 @@ def has_pending_fetched_assets(repository) -> bool:
         if node.data.get('type_id') in ASSET_TYPE_IDS:
             return True
     return False
+
+
+INITIAL_SYNC_TYPE_IDS = frozenset({
+    'Mesh', 'meshes', 'Object', 'objects', 'Collection', 'collections',
+    'Scene', 'scenes', 'World', 'worlds', 'GeometryNodeTree', 'Action',
+    'Curve', 'curves', 'Camera', 'cameras',
+})
+
+
+def count_fetched_datablocks(repository, type_ids: set[str] | frozenset[str] | None = None) -> int:
+    if repository is None:
+        return 0
+    count = 0
+    for node in repository.graph.values():
+        if node.state != FETCHED or not node.data:
+            continue
+        if type_ids is None or node.data.get('type_id') in type_ids:
+            count += 1
+    return count
+
+
+def has_pending_initial_sync_datablocks(repository) -> bool:
+    """True while scene content (meshes, objects, hierarchy) is still FETCHED."""
+    return count_fetched_datablocks(repository, INITIAL_SYNC_TYPE_IDS) > 0
 
 
 def has_pending_fetched_asset_type(repository, type_ids: set[str] | frozenset[str]) -> bool:

@@ -21,7 +21,7 @@ import logging
 import re
 
 from .dump_anything import Loader, Dumper
-from replication.constants import FETCHED
+from replication.constants import FETCHED, UP
 from replication import porcelain
 from replication.protocol import ReplicatedDatablock
 
@@ -30,7 +30,7 @@ from .bl_datablock import (
     preserve_replicated_datablock,
     resolve_datablock_from_uuid,
 )
-from ..utils import ASSET_TYPE_IDS
+from ..utils import ASSET_TYPE_IDS, network_log
 from .bl_action import (
     dump_animation_data,
     load_animation_data,
@@ -54,6 +54,129 @@ IGNORED_SOCKETS = [
 ]
 IGNORED_SOCKETS_TYPES = (NodeSocketGeometry, NodeSocketShader, NodeSocketVirtual)
 ID_NODE_SOCKETS = (NodeSocketObject, NodeSocketCollection, NodeSocketMaterial)
+_ENUM_SOCKET_TYPE_NAMES = frozenset({'NodeSocketMenu', 'NodeSocketEnum'})
+
+
+def _socket_accepts_default_value(socket, loaded_value) -> bool:
+    """Return False for empty or version-incompatible enum/menu socket values."""
+    if loaded_value == "" or loaded_value is None:
+        return False
+
+    bl_idname = getattr(socket, 'bl_idname', '') or type(socket).__name__
+    if bl_idname in _ENUM_SOCKET_TYPE_NAMES or 'Menu' in bl_idname or 'Enum' in bl_idname:
+        enum_items = getattr(socket, 'enum_items', None)
+        if enum_items is not None:
+            valid = {item.identifier for item in enum_items}
+            return loaded_value in valid
+    return True
+
+
+def _apply_socket_default_value(socket, loaded_value) -> bool:
+    """Apply a dumped socket default, skipping cross-version enum mismatches."""
+    try:
+        if isinstance(socket, ID_NODE_SOCKETS):
+            resolved = get_datablock_from_uuid(loaded_value, None)
+            if resolved is None:
+                return False
+            socket.default_value = resolved
+            return True
+        if not _socket_accepts_default_value(socket, loaded_value):
+            return False
+        socket.default_value = loaded_value
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _get_live_node(
+    node_tree: bpy.types.NodeTree,
+    node_id: str,
+    node_data: dict | None = None,
+):
+    """Resolve a dumped node id to a live node (id, name, or bl_idname fallback)."""
+    target_node = node_tree.nodes.get(node_id)
+    if target_node is not None:
+        return target_node
+    if node_data:
+        name = node_data.get('name')
+        if name and name != node_id:
+            target_node = node_tree.nodes.get(name)
+            if target_node is not None:
+                return target_node
+    return None
+
+
+def _missing_dump_node_ids(
+    tree_data: dict,
+    node_tree: bpy.types.NodeTree,
+) -> list[str]:
+    """Return dumped node ids that are not present in the live node tree."""
+    dump_nodes = tree_data.get('nodes') if tree_data else None
+    if not dump_nodes or node_tree is None:
+        return list(dump_nodes.keys()) if dump_nodes else []
+    return [
+        node_id for node_id in dump_nodes
+        if _get_live_node(node_tree, node_id, dump_nodes[node_id]) is None
+    ]
+
+
+def _material_tree_matches_dump(tree_data: dict, node_tree: bpy.types.NodeTree) -> bool:
+    """True when every dumped node exists in the live tree (not just Blender defaults)."""
+    dump_nodes = tree_data.get('nodes') if tree_data else None
+    if not dump_nodes or node_tree is None:
+        return False
+    return len(_missing_dump_node_ids(tree_data, node_tree)) == 0
+
+
+def load_node_io(nodes_data: dict, node_tree: bpy.types.ShaderNodeTree):
+    for node_id, node_data in nodes_data.items():
+        target_node = _get_live_node(node_tree, node_id, node_data)
+        if target_node is None:
+            logging.debug(
+                "Node IO skip: dumped node %r not found in live tree",
+                node_id,
+            )
+            continue
+        inputs_data = node_data.get('inputs')
+        if inputs_data:
+            inputs = [
+                i for i in target_node.inputs
+                if not isinstance(i, IGNORED_SOCKETS_TYPES)
+                and hasattr(i, "default_value")
+            ]
+            for idx, inpt in enumerate(inputs):
+                if idx < len(inputs_data):
+                    loaded_input = inputs_data[idx]
+                    if not _apply_socket_default_value(inpt, loaded_input):
+                        logging.debug(
+                            "Node %s input %s default skipped (cross-version or not ready)",
+                            target_node.name,
+                            inpt.name,
+                        )
+                else:
+                    logging.warning(f"Node {target_node.name} input length mismatch.")
+
+        outputs_data = node_data.get('outputs')
+        if outputs_data:
+            outputs = [
+                o for o in target_node.outputs
+                if not isinstance(o, IGNORED_SOCKETS_TYPES)
+                and hasattr(o, "default_value")
+            ]
+            for idx, output in enumerate(outputs):
+                if idx < len(outputs_data):
+                    loaded_output = outputs_data[idx]
+                    if not _apply_socket_default_value(output, loaded_output):
+                        logging.debug(
+                            "Node %s output %s default skipped (cross-version or not ready)",
+                            target_node.name,
+                            output.name,
+                        )
+                else:
+                    logging.warning(
+                        f"Node {target_node.name} output length mismatch.")
+
+
 SOCKET_ATTRIBUTES = [
     'name',
     'socket_type',
@@ -63,9 +186,34 @@ SOCKET_ATTRIBUTES = [
     'max_value',
     'subtype',
     'structure_type',
-    'default_closed',
-    'description'
+    'description',
 ]
+
+PANEL_ATTRIBUTES = [
+    'name',
+    'item_type',
+    'description',
+    'default_closed',
+]
+
+_SOCKET_ONLY_ATTRIBUTES = frozenset({
+    'socket_type', 'in_out', 'min_value', 'max_value', 'subtype', 'structure_type',
+})
+
+
+def _interface_include_filter(item) -> list[str]:
+    if getattr(item, 'item_type', None) == 'PANEL':
+        return PANEL_ATTRIBUTES
+    return SOCKET_ATTRIBUTES
+
+
+def _safe_interface_socket_type(item) -> str | None:
+    if getattr(item, 'item_type', None) != 'SOCKET':
+        return None
+    try:
+        return item.socket_type
+    except AttributeError:
+        return None
 
 def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
     """ Load a node into a node_tree from a dict
@@ -108,52 +256,6 @@ def load_node(node_data: dict, node_tree: bpy.types.ShaderNodeTree):
 
     return target_node
 
-
-def load_node_io(nodes_data: dict, node_tree: bpy.types.ShaderNodeTree):
-    for target_node in node_tree.nodes:
-        node_data = nodes_data[target_node.name]
-        inputs_data = node_data.get('inputs')
-        if inputs_data:
-            inputs = [
-                i for i in target_node.inputs
-                if not isinstance(i, IGNORED_SOCKETS_TYPES)
-                and hasattr(i, "default_value")
-            ]
-            for idx, inpt in enumerate(inputs):
-                if idx < len(inputs_data):
-                    loaded_input = inputs_data[idx]
-                    try:
-                        if isinstance(inpt, ID_NODE_SOCKETS):
-                            inpt.default_value = get_datablock_from_uuid(loaded_input, None)
-                        else:
-                            inpt.default_value = loaded_input
-                            setattr(inpt, 'default_value', loaded_input)
-                    except Exception as e:
-                        logging.warning(f"Node {target_node.name} input {inpt.name} parameter not supported, skipping ({e})")
-                else:
-                    logging.warning(f"Node {target_node.name} input length mismatch.")
-
-        outputs_data = node_data.get('outputs')
-        if outputs_data:
-            outputs = [
-                o for o in target_node.outputs
-                if not isinstance(o, IGNORED_SOCKETS_TYPES)
-                and hasattr(o, "default_value")
-            ]
-            for idx, output in enumerate(outputs):
-                if idx < len(outputs_data):
-                    loaded_output = outputs_data[idx]
-                    try:
-                        if isinstance(output, ID_NODE_SOCKETS):
-                            output.default_value = get_datablock_from_uuid(loaded_output, None)
-                        else:
-                            output.default_value = loaded_output
-                    except Exception as e:
-                        logging.warning(
-                            f"Node {target_node.name} output {output.name} parameter not supported, skipping ({e})")
-                else:
-                    logging.warning(
-                        f"Node {target_node.name} output length mismatch.")
 
 def dump_node(node: bpy.types.ShaderNode) -> dict:
     """ Dump a single node to a dict
@@ -257,6 +359,19 @@ def dump_node(node: bpy.types.ShaderNode) -> dict:
     return dumped_node
 
 
+def _resolve_node_socket(sockets, index, identifier=None):
+    """Resolve a dumped socket reference by index, then by identifier."""
+    if index is not None:
+        idx = int(index)
+        if 0 <= idx < len(sockets):
+            return sockets[idx]
+    if identifier:
+        for socket in sockets:
+            if getattr(socket, 'identifier', None) == identifier:
+                return socket
+    return None
+
+
 def load_links(links_data, node_tree):
     """ Load node_tree links from a list
 
@@ -277,33 +392,38 @@ def load_links(links_data, node_tree):
             )
             continue
 
-        to_idx = int(link['to_socket'])
-        from_idx = int(link['from_socket'])
-        if to_idx >= len(to_node.inputs) or from_idx >= len(from_node.outputs):
-            logging.warning(
-                "Skipping link %s.%s -> %s.%s: socket index out of range "
+        to_socket = _resolve_node_socket(
+            to_node.inputs,
+            link.get('to_socket'),
+            link.get('to_socket_identifier'),
+        )
+        from_socket = _resolve_node_socket(
+            from_node.outputs,
+            link.get('from_socket'),
+            link.get('from_socket_identifier'),
+        )
+        if to_socket is None or from_socket is None:
+            logging.debug(
+                "Skipping link %s.%s -> %s.%s: socket not found "
                 "(inputs=%d, outputs=%d)",
                 link.get('from_node'),
-                from_idx,
+                link.get('from_socket'),
                 link.get('to_node'),
-                to_idx,
+                link.get('to_socket'),
                 len(to_node.inputs),
                 len(from_node.outputs),
             )
             continue
 
         try:
-            node_tree.links.new(
-                to_node.inputs[to_idx],
-                from_node.outputs[from_idx],
-            )
+            node_tree.links.new(to_socket, from_socket)
         except Exception as e:
-            logging.warning(
+            logging.debug(
                 "Skipping link %s.%s -> %s.%s: %s",
                 link.get('from_node'),
-                from_idx,
+                link.get('from_socket'),
                 link.get('to_node'),
-                to_idx,
+                link.get('to_socket'),
                 e,
             )
 
@@ -326,8 +446,10 @@ def dump_links(links):
         links_data.append({
             'to_node': link.to_node.name,
             'to_socket': to_socket,
+            'to_socket_identifier': getattr(link.to_socket, 'identifier', None),
             'from_node': link.from_node.name,
             'from_socket': from_socket,
+            'from_socket_identifier': getattr(link.from_socket, 'identifier', None),
         })
 
     return links_data
@@ -363,9 +485,9 @@ def dump_node_tree_sockets(sockets: bpy.types.Collection) -> dict:
         :return: dict
     """
     socket_dumper = Dumper()
-    socket_dumper.include_filter = SOCKET_ATTRIBUTES
     sockets_data = []
     for socket in sockets:
+        socket_dumper.include_filter = _interface_include_filter(socket)
         socket_data = socket_dumper.dump(socket)
         if socket.parent and socket.parent.index != -1:
             socket_data['parent'] = socket.parent.index 
@@ -388,21 +510,27 @@ def load_node_tree_sockets(interface: bpy.types.NodeTreeInterface,
         :type socket_data: dict
     """
     interface.clear()
-    socket_loader = Loader()
 
     for socket_data in sockets_data:
-        if socket_data['item_type'] == 'SOCKET':
+        item_type = socket_data.get('item_type')
+        socket_loader = Loader()
+        if item_type == 'SOCKET':
             socket = interface.new_socket(
                 socket_data['name'],
                 in_out=socket_data['in_out'],
-                socket_type=socket_data['socket_type']
+                socket_type=socket_data['socket_type'],
             )
-        elif socket_data['item_type'] == 'PANEL':
+            socket_loader.exclure_filter = ['default_closed']
+        elif item_type == 'PANEL':
             socket = interface.new_panel(
                 socket_data['name'],
-                description=socket_data['description'],
-                default_closed=socket_data['default_closed']
+                description=socket_data.get('description', ''),
+                default_closed=socket_data.get('default_closed', False),
             )
+            socket_loader.exclure_filter = list(_SOCKET_ONLY_ATTRIBUTES)
+        else:
+            logging.debug("Skipping unknown node-tree interface item %r", item_type)
+            continue
         socket_loader.load(socket, socket_data)
 
 def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeTree) -> dict:
@@ -448,13 +576,38 @@ def load_node_tree(node_tree_data: dict, target_node_tree: bpy.types.ShaderNodeT
     finalize_node_tree(node_tree_data, target_node_tree)
 
 
-def resolve_node_group_refs(node_tree_data: dict, target_node_tree: bpy.types.NodeTree):
+def resolve_image_refs(node_tree_data: dict, target_node_tree: bpy.types.NodeTree) -> int:
+    """Assign image datablocks to TEX_IMAGE nodes once images are available."""
+    rebound = 0
+    for node_id, node_data in node_tree_data["nodes"].items():
+        image_uuid = node_data.get('image_uuid')
+        if not image_uuid:
+            continue
+        target_node = _get_live_node(target_node_tree, node_id, node_data)
+        if target_node is None or not hasattr(target_node, 'image'):
+            continue
+        image = resolve_datablock_from_uuid(image_uuid, bpy.data.images)
+        if image is None:
+            logging.debug(
+                "Image ref pending for node %s image_uuid=%s",
+                node_id,
+                image_uuid,
+            )
+            continue
+        if target_node.image != image:
+            target_node.image = image
+            rebound += 1
+    return rebound
+
+
+def resolve_node_group_refs(node_tree_data: dict, target_node_tree: bpy.types.NodeTree) -> int:
     """Assign nested node groups once their datablocks are available."""
+    rebound = 0
     for node_id, node_data in node_tree_data["nodes"].items():
         node_tree_uuid = node_data.get('node_tree_uuid')
         if not node_tree_uuid:
             continue
-        target_node = target_node_tree.nodes.get(node_id)
+        target_node = _get_live_node(target_node_tree, node_id, node_data)
         if target_node is None:
             continue
         node_group = get_datablock_from_uuid(node_tree_uuid, None)
@@ -467,16 +620,66 @@ def resolve_node_group_refs(node_tree_data: dict, target_node_tree: bpy.types.No
             continue
         if target_node.node_tree != node_group:
             target_node.node_tree = node_group
+            rebound += 1
+    return rebound
 
 
-def finalize_node_tree(node_tree_data: dict, target_node_tree: bpy.types.NodeTree):
-    """Resolve group references and wire links after all node trees are loaded."""
+def node_tree_needs_finalize(tree_data: dict, target_node_tree: bpy.types.NodeTree) -> bool:
+    """True when dumped refs exist locally but are not yet bound on the live tree."""
+    if not tree_data or target_node_tree is None:
+        return False
+    for node_id, node_data in tree_data.get("nodes", {}).items():
+        image_uuid = node_data.get('image_uuid')
+        if image_uuid:
+            target_node = _get_live_node(target_node_tree, node_id, node_data)
+            if (
+                target_node is not None
+                and hasattr(target_node, 'image')
+                and not target_node.image
+                and resolve_datablock_from_uuid(image_uuid, bpy.data.images) is not None
+            ):
+                return True
+        node_tree_uuid = node_data.get('node_tree_uuid')
+        if node_tree_uuid:
+            target_node = _get_live_node(target_node_tree, node_id, node_data)
+            group = get_datablock_from_uuid(node_tree_uuid, None)
+            if (
+                target_node is not None
+                and hasattr(target_node, 'node_tree')
+                and group is not None
+                and target_node.node_tree != group
+            ):
+                return True
+    return False
+
+
+def finalize_node_tree(
+    node_tree_data: dict,
+    target_node_tree: bpy.types.NodeTree,
+    owner_name: str = "",
+) -> dict[str, int]:
+    """Resolve image/group references and wire links after all node trees are loaded."""
+    stats = {'images_rebound': 0, 'groups_rebound': 0, 'links_wired': 0, 'links_skipped': 0}
     if not node_tree_data or target_node_tree is None:
-        return
-    resolve_node_group_refs(node_tree_data, target_node_tree)
+        return stats
+    stats['images_rebound'] = resolve_image_refs(node_tree_data, target_node_tree)
+    stats['groups_rebound'] = resolve_node_group_refs(node_tree_data, target_node_tree)
+    load_node_io(node_tree_data["nodes"], target_node_tree)
     target_node_tree.links.clear()
     load_links(node_tree_data["links"], target_node_tree)
-    load_node_io(node_tree_data["nodes"], target_node_tree)
+    stats['links_wired'] = len(target_node_tree.links)
+    stats['links_skipped'] = max(0, len(node_tree_data.get('links', [])) - stats['links_wired'])
+    if owner_name and (stats['images_rebound'] or stats['groups_rebound'] or stats['links_wired']):
+        network_log(
+            logging.INFO,
+            "Finalized node tree for %r: images=%s groups=%s links=%s (skipped=%s)",
+            owner_name,
+            stats['images_rebound'],
+            stats['groups_rebound'],
+            stats['links_wired'],
+            stats['links_skipped'],
+        )
+    return stats
 
 
 _node_trees_finalized = False
@@ -485,7 +688,7 @@ _node_tree_finalize_queue = []
 _geometry_node_tree_finalize_queue = []
 _node_tree_finalize_total = 0
 _geometry_node_tree_finalize_total = 0
-_NODE_TREE_FINALIZE_BATCH_SIZE = 2
+_NODE_TREE_FINALIZE_BATCH_SIZE = 8
 
 
 def reset_node_tree_finalize_state():
@@ -500,11 +703,39 @@ def reset_node_tree_finalize_state():
     _geometry_node_tree_finalize_total = 0
 
 
+def reset_material_finalize_state():
+    """Allow material node-tree finalization to run again after shader groups apply."""
+    global _node_trees_finalized, _node_tree_finalize_queue, _node_tree_finalize_total
+    _node_trees_finalized = False
+    _node_tree_finalize_queue = []
+    _node_tree_finalize_total = 0
+
+
 def _finalize_queue(queue: list, batch_size: int = _NODE_TREE_FINALIZE_BATCH_SIZE) -> int:
+    from .. import shared_data
+
     finalized = 0
     while queue and finalized < batch_size:
-        node_tree_data, target_node_tree = queue.pop(0)
-        finalize_node_tree(node_tree_data, target_node_tree)
+        node_tree_data, target_node_tree, owner_name = queue.pop(0)
+        owner = getattr(target_node_tree, 'id_data', None)
+        owner_uuid = getattr(owner, 'uuid', None)
+        if owner_uuid:
+            shared_data.session.applied_updates.append(owner_uuid)
+        try:
+            finalize_node_tree(node_tree_data, target_node_tree, owner_name=owner_name)
+        except Exception as exc:
+            logging.exception(
+                "Failed to finalize node tree for %r: %s",
+                owner_name or owner,
+                exc,
+            )
+            network_log(
+                logging.ERROR,
+                "Failed to finalize node tree for %r: %s: %s",
+                owner_name or getattr(owner, 'name', '?'),
+                type(exc).__name__,
+                exc,
+            )
         finalized += 1
     return finalized
 
@@ -533,8 +764,9 @@ def maybe_finalize_node_trees(repository) -> None:
                     if node_ref is None or not node_ref.data:
                         continue
                     if node_ref.data.get('type_id') == 'GeometryNodeTree':
+                        owner_name = node_ref.data.get('name', node_id)
                         _geometry_node_tree_finalize_queue.append(
-                            (node_ref.data, node_ref.instance)
+                            (node_ref.data, node_ref.instance, owner_name)
                         )
                 _geometry_node_tree_finalize_total = len(_geometry_node_tree_finalize_queue)
 
@@ -550,22 +782,178 @@ def maybe_finalize_node_trees(repository) -> None:
                 node.data.get('type_id') in ASSET_TYPE_IDS:
             return
 
+    pending_shader_groups = any(
+        node.state == FETCHED and node.data and
+        node.data.get('type_id') == 'ShaderNodeTree'
+        for node in repository.graph.values()
+    )
+    if pending_shader_groups:
+        return
+
     if not _node_tree_finalize_queue and _node_tree_finalize_total == 0:
-        for node_id in repository.heads:
-            node_ref = repository.graph.get(node_id)
-            if node_ref is None or not node_ref.data:
+        seen_trees: set[int] = set()
+        for node in repository.graph.values():
+            if node.state != UP or not node.data or not node.instance:
                 continue
-            type_id = node_ref.data.get('type_id')
-            if type_id == 'Material' and node_ref.data.get('use_nodes'):
-                if node_ref.instance and node_ref.instance.node_tree:
-                    _node_tree_finalize_queue.append(
-                        (node_ref.data['node_tree'], node_ref.instance.node_tree)
-                    )
+            if node.data.get('type_id') != 'Material' or not node.data.get('use_nodes'):
+                continue
+            material = node.instance
+            if material.node_tree is None or 'node_tree' not in node.data:
+                continue
+            tree_key = id(material.node_tree)
+            if tree_key in seen_trees:
+                continue
+            seen_trees.add(tree_key)
+            owner_name = node.data.get('name', node.uuid)
+            _node_tree_finalize_queue.append(
+                (node.data['node_tree'], material.node_tree, owner_name)
+            )
         _node_tree_finalize_total = len(_node_tree_finalize_queue)
+
+    if _node_tree_finalize_queue and _node_tree_finalize_total > 0:
+        network_log(
+            logging.INFO,
+            "Material node-tree finalize queue: %s/%s remaining",
+            len(_node_tree_finalize_queue),
+            _node_tree_finalize_total,
+        )
 
     _finalize_queue(_node_tree_finalize_queue)
     if not _node_tree_finalize_queue:
         _node_trees_finalized = True
+
+
+def log_material_node_tree_diagnostics(
+    material_name: str,
+    tree_data: dict,
+    node_tree: bpy.types.NodeTree,
+    label: str = "diagnostic",
+) -> None:
+    """Log node/image/link readiness for a material shader tree."""
+    dump_nodes = tree_data.get('nodes', {})
+    live_names = {n.name for n in node_tree.nodes}
+    dump_names = set(dump_nodes.keys())
+    matched = dump_names & live_names
+    missing_in_live = _missing_dump_node_ids(tree_data, node_tree)
+    extra_in_live = live_names - dump_names
+
+    unbound_images = 0
+    available_images = 0
+    for node_id, node_data in dump_nodes.items():
+        image_uuid = node_data.get('image_uuid')
+        if not image_uuid:
+            continue
+        live_node = _get_live_node(node_tree, node_id, node_data)
+        image = resolve_datablock_from_uuid(image_uuid, bpy.data.images)
+        if live_node is not None and hasattr(live_node, 'image') and not live_node.image:
+            if image is not None:
+                available_images += 1
+            else:
+                unbound_images += 1
+
+    network_log(
+        logging.INFO,
+        "%s material %r: nodes live=%s dump=%s matched=%s "
+        "missing=%s extra=%s links=%s/%s unbound_images=%s images_available=%s",
+        label,
+        material_name,
+        len(live_names),
+        len(dump_names),
+        len(matched),
+        len(missing_in_live),
+        len(extra_in_live),
+        len(node_tree.links),
+        len(tree_data.get('links', [])),
+        unbound_images,
+        available_images,
+    )
+    if missing_in_live:
+        network_log(
+            logging.DEBUG,
+            "%s material %r missing live nodes: %s",
+            label,
+            material_name,
+            sorted(missing_in_live)[:12],
+        )
+
+
+def repair_material_node_trees(repository) -> dict[str, int]:
+    """Re-bind image and group refs on all synced materials after dependencies exist."""
+    from replication.constants import UP
+
+    stats = {
+        'materials': 0,
+        'rebuilt': 0,
+        'images_rebound': 0,
+        'groups_rebound': 0,
+        'links_wired': 0,
+        'failed': 0,
+    }
+    for node in repository.graph.values():
+        if node.state != UP or not node.instance or not node.data:
+            continue
+        if node.data.get('type_id') != 'Material':
+            continue
+        if not node.data.get('use_nodes') or not node.data.get('node_tree'):
+            continue
+        material = node.instance
+        material_name = node.data.get('name', material.name)
+        if material.node_tree is None:
+            network_log(
+                logging.WARNING,
+                "Repair skip: material %r has no node_tree instance",
+                material_name,
+            )
+            continue
+        tree_data = node.data['node_tree']
+        try:
+            missing_nodes = _missing_dump_node_ids(tree_data, material.node_tree)
+            if missing_nodes:
+                network_log(
+                    logging.INFO,
+                    "Repair rebuild: material %r missing %s/%s dumped node(s) "
+                    "(live=%s, e.g. %s)",
+                    material_name,
+                    len(missing_nodes),
+                    len(tree_data.get('nodes', {})),
+                    len(material.node_tree.nodes),
+                    missing_nodes[:6],
+                )
+                load_node_tree(tree_data, material.node_tree)
+                stats['rebuilt'] += 1
+            else:
+                log_material_node_tree_diagnostics(
+                    material_name,
+                    tree_data,
+                    material.node_tree,
+                    label="pre-repair",
+                )
+                fin_stats = finalize_node_tree(
+                    tree_data,
+                    material.node_tree,
+                    owner_name=material_name,
+                )
+                stats['images_rebound'] += fin_stats['images_rebound']
+                stats['groups_rebound'] += fin_stats['groups_rebound']
+                stats['links_wired'] += fin_stats['links_wired']
+            stats['materials'] += 1
+            log_material_node_tree_diagnostics(
+                material_name,
+                tree_data,
+                material.node_tree,
+                label="post-repair",
+            )
+        except Exception as exc:
+            stats['failed'] += 1
+            logging.exception("Failed to repair material %r", material_name)
+            network_log(
+                logging.ERROR,
+                "Failed to repair material %r: %s: %s",
+                material_name,
+                type(exc).__name__,
+                exc,
+            )
+    return stats
 
 
 def get_node_tree_dependencies(node_tree: bpy.types.NodeTree) -> list:
@@ -643,6 +1031,10 @@ def refresh_mesh_material_slots(repository) -> int:
 
         mesh = node.instance
         before = [slot.name if slot else None for slot in mesh.materials]
+        unresolved_before = sum(
+            1 for mat_uuid, _ in materials
+            if mat_uuid and get_datablock_from_uuid(mat_uuid, None) is None
+        )
         load_materials_slots(materials, mesh.materials)
         after = [slot.name if slot else None for slot in mesh.materials]
 
@@ -654,13 +1046,44 @@ def refresh_mesh_material_slots(repository) -> int:
                 before,
                 after,
             )
+        elif unresolved_before:
+            network_log(
+                logging.INFO,
+                "Mesh %r still has %s unresolved material slot(s) after refresh",
+                mesh.name,
+                unresolved_before,
+            )
     return refreshed
 
 
 def register_scene_material_assets(repository) -> dict[str, int]:
-    """Register mesh/world materials (and their image files) on the host repository."""
-    stats = {'materials': 0, 'skipped': 0}
+    """Register materials, nested node groups, and texture deps on the host repository."""
+    stats = {'materials': 0, 'node_groups': 0, 'skipped': 0, 'missing_groups': 0}
     seen_materials: set[int] = set()
+    seen_groups: set[int] = set()
+
+    def register_node_group(node_group) -> None:
+        if node_group is None:
+            return
+        group_id = id(node_group)
+        if group_id in seen_groups:
+            return
+        seen_groups.add(group_id)
+        if repository.get_node_by_datablock(node_group):
+            return
+        try:
+            porcelain.add(repository, node_group, skip_unsupported=True)
+            stats['node_groups'] += 1
+            logging.info("Registered node group for sync: %s", node_group.name)
+        except Exception as exc:
+            logging.warning("Failed to register node group %s: %s", node_group.name, exc)
+            return
+        if node_group.nodes:
+            for dep in get_node_tree_dependencies(node_group):
+                if isinstance(dep, bpy.types.Image):
+                    continue
+                if isinstance(dep, bpy.types.NodeTree):
+                    register_node_group(dep)
 
     def register_material(material) -> None:
         if material is None:
@@ -678,10 +1101,34 @@ def register_scene_material_assets(repository) -> dict[str, int]:
             logging.info("Registered material for sync: %s", material.name)
         except Exception as exc:
             logging.warning("Failed to register material %s: %s", material.name, exc)
+            return
+        if material.use_nodes and material.node_tree:
+            for dep in get_node_tree_dependencies(material.node_tree):
+                if isinstance(dep, bpy.types.Image):
+                    continue
+                if isinstance(dep, bpy.types.NodeTree):
+                    register_node_group(dep)
 
     for mesh in bpy.data.meshes:
         for material in mesh.materials:
             register_material(material)
+
+    for material in bpy.data.materials:
+        register_material(material)
+
+    for material in bpy.data.materials:
+        if not material.use_nodes or not material.node_tree:
+            continue
+        for node in material.node_tree.nodes:
+            if not hasattr(node, 'node_tree') or not node.node_tree:
+                continue
+            if not repository.get_node_by_datablock(node.node_tree):
+                stats['missing_groups'] += 1
+                logging.warning(
+                    "Material %s references node group %s not registered for sync",
+                    material.name,
+                    node.node_tree.name,
+                )
 
     return stats
 
@@ -731,8 +1178,32 @@ class BlMaterial(ReplicatedDatablock):
             if datablock.node_tree is None:
                 datablock.use_nodes = True
 
-            load_node_tree(data['node_tree'], datablock.node_tree)
-            load_animation_data(data.get('nodes_animation_data'), datablock.node_tree)
+            tree_data = data['node_tree']
+            if _material_tree_matches_dump(tree_data, datablock.node_tree):
+                if node_tree_needs_finalize(tree_data, datablock.node_tree):
+                    finalize_node_tree(
+                        tree_data,
+                        datablock.node_tree,
+                        owner_name=datablock.name,
+                    )
+                load_animation_data(
+                    data.get('nodes_animation_data'),
+                    datablock.node_tree,
+                )
+            else:
+                network_log(
+                    logging.INFO,
+                    "Material %r: loading node tree from dump "
+                    "(live=%s nodes, dump=%s nodes)",
+                    datablock.name,
+                    len(datablock.node_tree.nodes) if datablock.node_tree else 0,
+                    len(tree_data.get('nodes', {})),
+                )
+                load_node_tree(tree_data, datablock.node_tree)
+                load_animation_data(
+                    data.get('nodes_animation_data'),
+                    datablock.node_tree,
+                )
         load_animation_data(data.get('animation_data'), datablock)
         preserve_replicated_datablock(datablock)
         logging.info(

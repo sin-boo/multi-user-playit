@@ -44,7 +44,7 @@ from . import bl_types, shared_data, timers, utils
 from .bl_types.bl_file import is_replicated_file
 from .bl_types.bl_material import reset_node_tree_finalize_state, register_scene_material_assets
 from .handlers import on_scene_update
-from .presence import (SessionStatusWidget, MaterialsFetchWidget, bbox_from_obj,
+from .presence import (SessionStatusWidget, bbox_from_obj,
                        refresh_sidebar_view, presence_viewer, view3d_find)
 from .timers import timers_registry
 
@@ -226,7 +226,6 @@ def on_connection_end(reason="none"):
 
     presence_viewer.clear_widgets()
     presence_viewer.add_widget("session_status", SessionStatusWidget())
-    presence_viewer.add_widget("material_fetch", MaterialsFetchWidget())
 
     # Step 3: remove file handled
     logger = logging.getLogger()
@@ -481,9 +480,12 @@ class SessionHostOperator(bpy.types.Operator):
             material_stats = register_scene_material_assets(repo)
             utils.network_log(
                 logging.INFO,
-                "Host registered %s material(s) for replication (%s already tracked)",
+                "Host registered %s material(s), %s node group(s) for replication "
+                "(%s already tracked, %s missing group warning(s))",
                 material_stats['materials'],
+                material_stats['node_groups'],
                 material_stats['skipped'],
+                material_stats['missing_groups'],
             )
 
             porcelain.remote_add(
@@ -559,9 +561,12 @@ class SessionInitOperator(bpy.types.Operator):
         material_stats = register_scene_material_assets(session.repository)
         utils.network_log(
             logging.INFO,
-            "Session init registered %s material(s) (%s already tracked)",
+            "Session init registered %s material(s), %s node group(s) "
+            "(%s already tracked, %s missing group warning(s))",
             material_stats['materials'],
+            material_stats['node_groups'],
             material_stats['skipped'],
+            material_stats['missing_groups'],
         )
 
         session.init()

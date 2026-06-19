@@ -47,22 +47,34 @@ SUPPORTED_GEOMETRY_NODE_PARAMETERS = (int, str, float)
 NODE_SOCKET_ID = ['NodeSocketCollection', 'NodeSocketObject', 'NodeSocketImage', 'NodeSocketTexture', 'NodeSocketMaterial']
 
 
+def _safe_interface_socket_type(item) -> str | None:
+    if getattr(item, 'item_type', None) != 'SOCKET':
+        return None
+    try:
+        return item.socket_type
+    except AttributeError:
+        return None
+
+
 def get_node_group_properties_identifiers(node_group):
     props_ids = []
     if not node_group:
         return props_ids
-    for socket in node_group.interface.items_tree:
-        if not hasattr(socket, 'socket_type') or socket.socket_type in IGNORED_SOCKETS:
+    for item in node_group.interface.items_tree:
+        if getattr(item, 'item_type', None) != 'SOCKET':
             continue
-        
-        # TODO: Clean 
-        if socket.socket_type not in NODE_SOCKET_ID:
-            props_ids.append((f"{socket.identifier}_attribute_name", 'NodeSocketString'))
-        if socket.in_out == 'OUTPUT':
+        socket_type = _safe_interface_socket_type(item)
+        if socket_type is None or socket_type in IGNORED_SOCKETS:
             continue
-        props_ids.append((socket.identifier, socket.socket_type))
-        if socket.socket_type not in NODE_SOCKET_ID:
-            props_ids.append((f"{socket.identifier}_use_attribute", 'NodeSocketBool'))
+
+        # TODO: Clean
+        if socket_type not in NODE_SOCKET_ID:
+            props_ids.append((f"{item.identifier}_attribute_name", 'NodeSocketString'))
+        if item.in_out == 'OUTPUT':
+            continue
+        props_ids.append((item.identifier, socket_type))
+        if socket_type not in NODE_SOCKET_ID:
+            props_ids.append((f"{item.identifier}_use_attribute", 'NodeSocketBool'))
 
     return props_ids
 

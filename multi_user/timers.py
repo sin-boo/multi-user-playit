@@ -31,6 +31,8 @@ from . import utils
 from .bl_types.bl_material import (
     maybe_finalize_node_trees,
     refresh_mesh_material_slots,
+    repair_material_node_trees,
+    reset_material_finalize_state,
 )
 from .bl_types.bl_image import reload_images_waiting_for_files
 from .bl_types.bl_file import is_replicated_file
@@ -161,8 +163,41 @@ class ApplyTimer(Timer):
     _logged_construct_skips: set[str] = set()
     _had_deferred_objects = False
     _sync_hierarchy_done = False
+    _material_graph_repair_done = False
+    _material_slots_refreshed = False
+    _next_interval: float | None = None
     _MAX_APPLY_RETRIES = 3
     _MAX_HIERARCHY_RETRIES = 12
+    # During the initial post-fetch sync, apply quickly instead of waiting for
+    # depsgraph_update_rate between every small batch.
+    _INITIAL_SYNC_BATCH_SIZE = 30
+    _SYNC_TIME_BUDGET_S = 0.08
+
+    def main(self):
+        try:
+            self._next_interval = None
+            self.execute()
+        except Exception as e:
+            logging.error(e)
+            traceback.print_exc()
+            utils.network_log(
+                logging.ERROR,
+                "Timer %s failed: %s: %s",
+                self.id,
+                type(e).__name__,
+                e,
+            )
+            utils.network_log(logging.ERROR, traceback.format_exc())
+            self.unregister()
+            if self.disconnect_on_error and session.state != STATE_INITIAL:
+                session.disconnect(
+                    reason=f"Timer {self.id}: {type(e).__name__}: {e}"
+                )
+        else:
+            if self.is_running:
+                settings = utils.get_preferences()
+                idle_rate = settings.depsgraph_update_rate if settings else 1.0
+                return self._next_interval if self._next_interval is not None else idle_rate
 
     @classmethod
     def _schedule_defer(cls, node_uuid: str, now: float, base_delay: float = 0.5) -> None:
@@ -181,6 +216,8 @@ class ApplyTimer(Timer):
         cls._logged_construct_skips.clear()
         cls._had_deferred_objects = False
         cls._sync_hierarchy_done = False
+        cls._material_graph_repair_done = False
+        cls._material_slots_refreshed = False
 
     def execute(self):
         if not session or session.state != STATE_ACTIVE:
@@ -193,6 +230,14 @@ class ApplyTimer(Timer):
 
         settings = utils.get_preferences()
         batch_size = settings.apply_batch_size if settings else 10
+        idle_rate = settings.depsgraph_update_rate if settings else 1.0
+        burst_sync = utils.count_fetched_datablocks(session.repository) > 0
+        if burst_sync:
+            batch_size = max(batch_size, ApplyTimer._INITIAL_SYNC_BATCH_SIZE)
+        sync_deadline = (
+            time.monotonic() + ApplyTimer._SYNC_TIME_BUDGET_S
+            if burst_sync else None
+        )
         applied = 0
         pending_assets = utils.has_pending_fetched_assets(session.repository)
 
@@ -233,7 +278,11 @@ class ApplyTimer(Timer):
                     defer_state = ApplyTimer._deferred_nodes.get(node_ref.uuid)
                     if defer_state and now < defer_state[1]:
                         continue
-                    ApplyTimer._schedule_defer(node_ref.uuid, now)
+                    ApplyTimer._schedule_defer(
+                        node_ref.uuid,
+                        now,
+                        base_delay=0.0 if burst_sync else 0.5,
+                    )
                     continue
             defer_state = ApplyTimer._deferred_nodes.get(node_ref.uuid)
             if defer_state and now < defer_state[1]:
@@ -260,6 +309,8 @@ class ApplyTimer(Timer):
 
         for _, node, type_id in candidates:
             if applied >= batch_size:
+                break
+            if sync_deadline is not None and time.monotonic() >= sync_deadline:
                 break
 
             node_ref = session.repository.graph.get(node)
@@ -295,7 +346,11 @@ class ApplyTimer(Timer):
                             block_name,
                         )
                     if node_ref:
-                        ApplyTimer._schedule_defer(node_ref.uuid, now)
+                        ApplyTimer._schedule_defer(
+                            node_ref.uuid,
+                            now,
+                            base_delay=0.0 if burst_sync else 0.5,
+                        )
                     continue
 
             block_name = node_ref.data.get('name', '?') if node_ref.data else '?'
@@ -313,7 +368,10 @@ class ApplyTimer(Timer):
             except Exception:
                 failures, _ = ApplyTimer._failed_apply_nodes.get(node_ref.uuid, (0, 0.0))
                 failures += 1
-                retry_delay = min(30.0, 2.0 ** failures)
+                if burst_sync:
+                    retry_delay = min(2.0, 0.25 * failures)
+                else:
+                    retry_delay = min(30.0, 2.0 ** failures)
                 ApplyTimer._failed_apply_nodes[node_ref.uuid] = (
                     failures,
                     time.monotonic() + retry_delay,
@@ -338,8 +396,13 @@ class ApplyTimer(Timer):
                 ApplyTimer._failed_apply_nodes.pop(node_ref.uuid, None)
                 ApplyTimer._deferred_nodes.pop(node_ref.uuid, None)
                 applied += 1
+                if type_id == 'ShaderNodeTree' and not ApplyTimer._sync_hierarchy_done:
+                    reset_material_finalize_state()
                 impl = session.repository.rdp.get_implementation(node_ref.instance)
-                if impl.bl_reload_parent:
+                # During the first full sync, datablocks are applied in dependency
+                # order already. Parent/child force-reloads only duplicate work and
+                # trigger redundant material/texture reload cascades.
+                if ApplyTimer._sync_hierarchy_done and impl.bl_reload_parent:
                     for parent in session.repository.graph.get_parents(node):
                         logging.debug("Refresh parent {node}")
                         try:
@@ -356,7 +419,11 @@ class ApplyTimer(Timer):
                         except Exception:
                             logging.error(f"Fail to refresh parent {parent.uuid}")
                             traceback.print_exc()
-                if hasattr(impl, 'bl_reload_child') and impl.bl_reload_child:
+                if (
+                    ApplyTimer._sync_hierarchy_done
+                    and hasattr(impl, 'bl_reload_child')
+                    and impl.bl_reload_child
+                ):
                     for dep in node_ref.dependencies:
                         dep_node = session.repository.graph.get(dep)
                         if dep_node and dep_node.state == UP and dep_node.data:
@@ -424,18 +491,28 @@ class ApplyTimer(Timer):
 
         try:
             maybe_finalize_node_trees(session.repository)
-        except Exception:
-            logging.error("Failed to finalize node trees")
-            traceback.print_exc()
+        except Exception as exc:
+            logging.exception("Failed to finalize node trees")
+            utils.network_log(
+                logging.ERROR,
+                "maybe_finalize_node_trees failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
-        if not pending_assets_after:
-            refreshed = refresh_mesh_material_slots(session.repository)
-            if refreshed:
-                utils.network_log(
-                    logging.INFO,
-                    "Refreshed material slots on %s mesh(es) after finalize",
-                    refreshed,
-                )
+        initial_sync_pending = utils.has_pending_initial_sync_datablocks(
+            session.repository,
+        )
+
+        if not pending_assets_after and not initial_sync_pending:
+            if applied and not ApplyTimer._logged_post_asset_summary:
+                refreshed = refresh_mesh_material_slots(session.repository)
+                if refreshed:
+                    utils.network_log(
+                        logging.INFO,
+                        "Refreshed material slots on %s mesh(es) after finalize",
+                        refreshed,
+                    )
             reloaded = reload_images_waiting_for_files(session.repository)
             if reloaded:
                 utils.network_log(
@@ -446,11 +523,11 @@ class ApplyTimer(Timer):
 
         # Once assets are synced, keep linking collections/scenes so objects
         # become visible even if a few datablocks are still FETCHED.
-        fetched_remaining = sum(
-            1 for node in session.repository.graph.values()
-            if node.state == FETCHED
-        )
-        if not pending_assets_after and not ApplyTimer._sync_hierarchy_done:
+        if (
+            not pending_assets_after
+            and not initial_sync_pending
+            and not ApplyTimer._sync_hierarchy_done
+        ):
             try:
                 utils.refresh_scene_hierarchy(session.repository)
             except Exception:
@@ -465,8 +542,67 @@ class ApplyTimer(Timer):
             )
             if has_linked_scene:
                 ApplyTimer._sync_hierarchy_done = True
+                utils.network_log(logging.INFO, "Initial scene hierarchy linked")
 
-        if not pending_assets_after:
+        if (
+            ApplyTimer._sync_hierarchy_done
+            and not ApplyTimer._material_graph_repair_done
+            and not pending_assets_after
+            and not initial_sync_pending
+        ):
+            try:
+                repair_stats = repair_material_node_trees(session.repository)
+                utils.network_log(
+                    logging.INFO,
+                    "Repaired material node trees: %s material(s) (%s rebuilt, %s failed), "
+                    "%s image ref(s), %s group ref(s), %s links wired",
+                    repair_stats['materials'],
+                    repair_stats['rebuilt'],
+                    repair_stats['failed'],
+                    repair_stats['images_rebound'],
+                    repair_stats['groups_rebound'],
+                    repair_stats['links_wired'],
+                )
+            except Exception as exc:
+                logging.exception("Material graph repair pass failed")
+                utils.network_log(
+                    logging.ERROR,
+                    "Material graph repair pass failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            finally:
+                ApplyTimer._material_graph_repair_done = True
+            refreshed = refresh_mesh_material_slots(session.repository)
+            if refreshed:
+                utils.network_log(
+                    logging.INFO,
+                    "Refreshed material slots on %s mesh(es) after graph repair",
+                    refreshed,
+                )
+            else:
+                utils.network_log(
+                    logging.INFO,
+                    "Material slot refresh after graph repair: no mesh slot changes",
+                )
+            ApplyTimer._material_slots_refreshed = True
+
+        if (
+            ApplyTimer._sync_hierarchy_done
+            and not ApplyTimer._material_slots_refreshed
+            and not pending_assets_after
+            and not initial_sync_pending
+        ):
+            refreshed = refresh_mesh_material_slots(session.repository)
+            if refreshed:
+                utils.network_log(
+                    logging.INFO,
+                    "Refreshed material slots on %s mesh(es) after initial sync",
+                    refreshed,
+                )
+            ApplyTimer._material_slots_refreshed = True
+
+        if not pending_assets_after and not initial_sync_pending:
             runtime = getattr(bpy.context.window_manager, 'session', None)
             is_host = bool(runtime and runtime.is_host)
             if not is_host:
@@ -486,6 +622,13 @@ class ApplyTimer(Timer):
                         )
                 except Exception:
                     logging.exception("Failed to switch client to host scene")
+
+        remaining_fetched = utils.count_fetched_datablocks(session.repository)
+        more_candidates = len(candidates) > applied
+        if remaining_fetched > 0 or (burst_sync and (applied > 0 or more_candidates)):
+            self._next_interval = 0.0
+        else:
+            self._next_interval = idle_rate
 
 
 class AnnotationUpdates(Timer):
@@ -705,8 +848,6 @@ class ClientUpdate(Timer):
 
 
 class SessionStatusUpdate(Timer):
-    _last_asset_progress = (-1, -1, False)
-    _last_shading_active = False
     _fast_refresh = False
 
     def __init__(self, timeout=1):
@@ -714,21 +855,11 @@ class SessionStatusUpdate(Timer):
 
     def execute(self):
         refresh_sidebar_view()
-
         utils.update_textures_fetch_on_shading_change(bpy.context)
         textures_enabled = utils.textures_fetch_enabled(bpy.context)
         applied, total = utils.get_asset_sync_progress()
-        shading_active = utils.is_texture_shading_active(bpy.context)
-        progress_key = (applied, total, textures_enabled)
-
-        if progress_key != SessionStatusUpdate._last_asset_progress or \
-                shading_active != SessionStatusUpdate._last_shading_active:
-            SessionStatusUpdate._last_asset_progress = progress_key
-            SessionStatusUpdate._last_shading_active = shading_active
-            refresh_3d_view()
-
-        pending_assets = textures_enabled and total > 0 and applied < total
         scene_applied, scene_total = utils.get_scene_apply_progress()
+        pending_assets = textures_enabled and total > 0 and applied < total
         pending_scene = scene_total > 0 and scene_applied < scene_total
         pending = pending_assets or pending_scene
         if pending and not SessionStatusUpdate._fast_refresh:

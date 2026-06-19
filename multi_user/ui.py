@@ -801,8 +801,6 @@ class VIEW3D_PT_overlay_session(bpy.types.Panel):
             text_scale.active = settings.presence_show_session_status
             text_scale.prop(pref, "presence_hud_scale", expand=True)
 
-        col.prop(settings, "presence_show_material_fetch_status")
-
 
 class SESSION_UL_network(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index, flt_flag):

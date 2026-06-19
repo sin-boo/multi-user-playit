@@ -272,14 +272,20 @@ class SessionPrefs(bpy.types.AddonPreferences):
     # Replication update settings
     depsgraph_update_rate: bpy.props.FloatProperty(
         name='depsgraph update rate (s)',
-        description='Dependency graph uppdate rate (s)',
-        default=1
+        description=(
+            'Pause between apply ticks while online and idle. '
+            'During the initial post-fetch sync the add-on chains apply steps '
+            'immediately instead of waiting for this delay'
+        ),
+        default=1,
+        min=0,
     )  # type:ignore
     apply_batch_size: bpy.props.IntProperty(
         name='apply batch size',
         description=(
-            "How many datablocks to apply to Blender per tick after fetching. "
-            "Lower values are safer for large scenes"
+            "How many datablocks to apply per tick after fetching. "
+            "During the initial sync this is raised automatically for speed. "
+            "Lower values are safer for large scenes during live collaboration"
         ),
         default=5,
         min=1,
@@ -668,11 +674,6 @@ class SessionProps(bpy.types.PropertyGroup):
     presence_show_session_status: bpy.props.BoolProperty(
         name="Show session status ",
         description="Show session status on the viewport",
-        default=True,
-    )  # type:ignore
-    presence_show_material_fetch_status: bpy.props.BoolProperty(
-        name="Show material fetch progress",
-        description="Show material fetch progress in the viewport while images and materials sync",
         default=True,
     )  # type:ignore
     textures_fetch_enabled: bpy.props.BoolProperty(

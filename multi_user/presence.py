@@ -26,12 +26,11 @@ import gpu
 import mathutils
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
-from replication.constants import STATE_ACTIVE, STATE_INITIAL
+from replication.constants import (STATE_ACTIVE, STATE_INITIAL, STATE_SRV_SYNC,
+                                   STATE_SYNCING, STATE_WAITING)
 from replication.interface import session
 
-from .utils import (find_from_attr, get_asset_sync_progress, get_preferences,
-                    get_state_str, printProgressBar,
-                    textures_fetch_enabled)
+from .utils import find_from_attr, get_preferences, get_state_str
 
 # Helper functions
 
@@ -504,8 +503,13 @@ class SessionStatusWidget(Widget):
         return getattr(bpy.context.window_manager, 'session', None)
 
     def poll(self):
-        return self.settings and self.settings.presence_show_session_status and \
-            self.settings.enable_presence
+        if not self.settings or not self.settings.presence_show_session_status:
+            return False
+        if not self.settings.enable_presence:
+            return False
+        if session.state in (STATE_SYNCING, STATE_SRV_SYNC, STATE_WAITING):
+            return False
+        return True
 
     def draw(self):
         text_scale = self.preferences.presence_hud_scale
@@ -525,57 +529,6 @@ class SessionStatusWidget(Widget):
         blf.size(0, int(text_scale*ui_scale))
         blf.color(0, color[0], color[1], color[2], color[3])
         blf.draw(0,  state_str)
-
-
-class MaterialsFetchWidget(Widget):
-    draw_type = 'POST_PIXEL'
-
-    def __init__(self):
-        self.preferences = get_preferences()
-
-    @property
-    def settings(self):
-        return getattr(bpy.context.window_manager, 'session', None)
-
-    def poll(self):
-        if not self.settings or not self.settings.enable_presence:
-            return False
-        if not getattr(self.settings, 'presence_show_material_fetch_status', True):
-            return False
-        if session.state != STATE_ACTIVE:
-            return False
-        if not textures_fetch_enabled(bpy.context):
-            return False
-        applied, total = get_asset_sync_progress()
-        return total > 0 and applied < total
-
-    def draw(self):
-        text_scale = self.preferences.presence_hud_scale
-        ui_scale = bpy.context.preferences.view.ui_scale
-        font_size = int(text_scale * ui_scale)
-        color = [1, 0.85, 0.2, 1]
-        area = bpy.context.area
-        if area is None:
-            return
-        hpos = (self.preferences.presence_hud_hpos * area.width) / 100
-        vpos = (self.preferences.presence_hud_vpos * area.height) / 100
-        line_height = font_size + 6
-
-        applied, total = get_asset_sync_progress()
-        progress = printProgressBar(applied, total, length=20)
-
-        font_id = 0
-        blf.enable(font_id, blf.SHADOW)
-        blf.position(font_id, hpos, vpos + line_height * 2, 0)
-        blf.size(font_id, font_size)
-        blf.color(font_id, color[0], color[1], color[2], color[3])
-        blf.draw(font_id, "Fetching materials")
-
-        blf.position(font_id, hpos, vpos + line_height, 0)
-        blf.size(font_id, font_size)
-        blf.color(font_id, color[0], color[1], color[2], color[3])
-        blf.draw(font_id, progress)
-        blf.disable(font_id, blf.SHADOW)
 
 
 class DrawFactory(object):
@@ -649,7 +602,6 @@ def register():
     global presence_viewer
     presence_viewer.register_handlers()
     presence_viewer.add_widget("session_status", SessionStatusWidget())
-    presence_viewer.add_widget("material_fetch", MaterialsFetchWidget())
 
 
 def unregister():
